@@ -98,6 +98,18 @@ tolerations:
 {{- end }}
 {{- end -}}
 
+{{- /*
+Helm test pods (except node-runtime-test): union of controlPlane+compute
+taint tolerations, no nodeSelector (control-only / compute-only / mixed).
+*/ -}}
+{{- define "cube.testPlacement" -}}
+{{- $tolerations := concat (.Values.placement.controlPlane.tolerations | default list) (.Values.placement.compute.tolerations | default list) -}}
+{{- with $tolerations }}
+tolerations:
+  {{- toYaml . | nindent 2 }}
+{{- end }}
+{{- end -}}
+
 {{- define "cube.pvmPlacement" -}}
 {{- $root := . -}}
 {{- $gateEnabled := eq (include "cube.startupGateEnabled" .) "true" -}}

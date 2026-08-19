@@ -1020,10 +1020,14 @@ rbac:
 
 helmTest:
   enabled: true
+  # HTTP + DNS tests. DNS uses `getent ahostsv4` (musl); do not override
+  # with busybox (nslookup times out on CoreDNS rewrite zones).
   image:
     repository: curlimages/curl
     tag: "8.10.1"
     pullPolicy: IfNotPresent
+  # node-runtime-test only (not used by dns-test). Operators who previously
+  # overrode this for the DNS test should set helmTest.image instead.
   dnsImage:
     repository: busybox
     tag: "1.36"

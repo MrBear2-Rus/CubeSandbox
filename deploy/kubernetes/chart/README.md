@@ -572,6 +572,17 @@ kubectl exec -n cube-system deploy/cube-cubemastercli -- \
 helm test cube -n cube-system --timeout 20m
 ```
 
+`helm test` pods (except `node-runtime-test`) use `cube.testPlacement`: they
+tolerate both control and compute taints and do **not** pin a nodeSelector,
+so they stay schedulable on control-only, compute-only, and mixed topologies.
+`node-runtime-test` uses `computePlacement` because it mounts hostPaths that
+only exist on cube-node hosts (it is skipped when `cubeNode.enabled=false`).
+
+Lookups are IPv4-only (`curl -4` / `getent ahostsv4`) because AAAA probes of
+the probed names stall in practice. Override `helmTest.image` only with an
+image that ships musl `getent`; `helmTest.dnsImage` is the node-runtime-test
+image (busybox by default).
+
 ## Upgrade policy
 
 `cube-node` is a native `apps/v1` DaemonSet. Bumping Big Pod runtime images
