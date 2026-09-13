@@ -5,19 +5,33 @@ on:
     branches: [master]
     paths:
       - 'docker/Dockerfile.cube-base'
+      - 'docker/Dockerfile.cube-base-upstream'
       - 'docker/cube-entrypoint.sh'
+      - 'cube-envd/**'
+      - 'Makefile'
       - '.github/workflows/build-envd-base-image.yml'
   pull_request:
     paths:
       - 'docker/Dockerfile.cube-base'
+      - 'docker/Dockerfile.cube-base-upstream'
       - 'docker/cube-entrypoint.sh'
+      - 'cube-envd/**'
+      - 'Makefile'
       - '.github/workflows/build-envd-base-image.yml'
   workflow_dispatch:
     inputs:
       envd_ref:
-        description: 'Upstream e2b-dev/infra ref (tag/branch/SHA) to compile envd from'
+        description: 'Upstream e2b-dev/infra ref used by the rollback implementation'
         required: false
         default: '2026.16'
+      envd_impl:
+        description: 'envd implementation to build'
+        required: false
+        type: choice
+        options:
+          - cube-envd
+          - upstream-e2b
+        default: cube-envd
 
 env:
   ENVD_REF_DEFAULT: '2026.16'
@@ -25,15 +39,32 @@ env:
   BASE_OS_TAG_SUFFIX: ubuntu22.04
 
 concurrency:
-  group: build-envd-base-image-${{ github.ref }}-${{ github.event.inputs.envd_ref || 'default' }}
+  group: build-envd-base-image-${{ github.ref }}-${{ inputs.envd_impl || 'cube-envd' }}-${{ github.event.inputs.envd_ref || 'default' }}
   cancel-in-progress: false
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    name: Build envd base image (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
       packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        # arm64 runs on a native ARM runner (same convention as
+        # unit-test-check.yml), so cube-envd is really compiled and executed on
+        # aarch64 rather than emulated through QEMU. Publishing stays amd64-only
+        # for now; the arm64 leg is a build + smoke gate.
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-latest
+            publish: true
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            publish: false
 
     steps:
       - name: Checkout
@@ -42,9 +73,33 @@ jobs:
       - name: Resolve envd ref
         id: meta_ref
         run: |
-          envd_ref="${{ github.event.inputs.envd_ref || env.ENVD_REF_DEFAULT }}"
+          envd_ref="${{ inputs.envd_ref || env.ENVD_REF_DEFAULT }}"
           echo "envd_ref=${envd_ref}" >> "${GITHUB_OUTPUT}"
-          echo "Compiling envd from e2b-dev/infra@${envd_ref}"
+
+      - name: Resolve envd implementation
+        id: meta_impl
+        run: |
+          envd_impl="${{ inputs.envd_impl || 'cube-envd' }}"
+          case "${envd_impl}" in
+            cube-envd)
+              dockerfile="docker/Dockerfile.cube-base"
+              label="cube-envd-rust"
+              ;;
+            upstream-e2b)
+              dockerfile="docker/Dockerfile.cube-base-upstream"
+              label="upstream-e2b"
+              ;;
+            *)
+              echo "Unsupported envd implementation: ${envd_impl}" >&2
+              exit 1
+              ;;
+          esac
+          {
+            echo "envd_impl=${envd_impl}"
+            echo "dockerfile=${dockerfile}"
+            echo "label=${label}"
+          } >> "${GITHUB_OUTPUT}"
+          echo "Building envd implementation ${envd_impl}"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -69,26 +124,28 @@ jobs:
             type=sha,prefix=sha-,format=short
           labels: |
             io.cubesandbox.envd.ref=${{ steps.meta_ref.outputs.envd_ref }}
+            io.cubesandbox.envd.impl=${{ steps.meta_impl.outputs.label }}
 
       - name: Build image (load locally for smoke test)
         uses: docker/build-push-action@v6
         with:
-          context: docker
-          file: docker/Dockerfile.cube-base
-          platforms: linux/amd64
+          context: .
+          file: ${{ steps.meta_impl.outputs.dockerfile }}
+          platforms: ${{ matrix.platform }}
           push: false
           load: true
-          tags: cubesandbox-base:ci-smoke
+          tags: cubesandbox-base:ci-smoke-${{ matrix.arch }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             ENVD_REF=${{ steps.meta_ref.outputs.envd_ref }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+            ENVD_IMPL=${{ steps.meta_impl.outputs.envd_impl }}
+          cache-from: type=gha,scope=envd-base-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=envd-base-${{ matrix.arch }}
 
-      - name: Smoke test envd /health
+      - name: Smoke test envd /health (${{ matrix.arch }})
         run: |
           set -euo pipefail
-          cid="$(docker run -d --rm cubesandbox-base:ci-smoke)"
+          cid="$(docker run -d --rm cubesandbox-base:ci-smoke-${{ matrix.arch }})"
           trap 'docker rm -f "${cid}" >/dev/null 2>&1 || true' EXIT
 
           ok=""
@@ -113,17 +170,25 @@ jobs:
           docker exec "${cid}" /usr/bin/envd -version
           docker exec "${cid}" /usr/bin/envd -commit
 
+          if [ "${{ steps.meta_impl.outputs.envd_impl }}" = "cube-envd" ]; then
+            docker exec "${cid}" /usr/bin/envd -version | grep -q '^cube-envd '
+          fi
+
+          echo "container arch:"
+          docker exec "${cid}" uname -m
+
       - name: Push image
-        if: github.repository == 'TencentCloud/CubeSandbox' && github.ref == 'refs/heads/master'
+        if: github.repository == 'TencentCloud/CubeSandbox' && github.ref == 'refs/heads/master' && matrix.publish
         uses: docker/build-push-action@v6
         with:
-          context: docker
-          file: docker/Dockerfile.cube-base
-          platforms: linux/amd64
+          context: .
+          file: ${{ steps.meta_impl.outputs.dockerfile }}
+          platforms: ${{ matrix.platform }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             ENVD_REF=${{ steps.meta_ref.outputs.envd_ref }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+            ENVD_IMPL=${{ steps.meta_impl.outputs.envd_impl }}
+          cache-from: type=gha,scope=envd-base-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=envd-base-${{ matrix.arch }}

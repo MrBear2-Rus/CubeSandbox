@@ -12,6 +12,7 @@ on:
       - 'CubeShim/**'
       - 'CubeNet/**'
       - 'cubelog/**'
+      - 'cube-envd/**'
       - 'cube-lifecycle-manager/**'
       - 'Cubelet/**'
       - 'agent/**'
@@ -30,6 +31,7 @@ on:
       - 'CubeShim/**'
       - 'CubeNet/**'
       - 'cubelog/**'
+      - 'cube-envd/**'
       - 'cube-lifecycle-manager/**'
       - 'Cubelet/**'
       - 'agent/**'
@@ -48,6 +50,7 @@ on:
         options:
           - all
           - cubeapi
+          - cube-envd
           - cubeops
           - cubeproxy
           - cubemaster
@@ -108,6 +111,7 @@ jobs:
             add_component "CubeProxy"
             add_component "CubeMaster"
             add_component "CubeShim"
+            add_component "cube-envd"
             add_component "cubecow"
             add_component "cubelog"
             add_component "cubedb"
@@ -126,6 +130,7 @@ jobs:
               cubeproxy) add_component "CubeProxy" ;;
               cubemaster) add_component "CubeMaster" ;;
               cubeshim) add_component "CubeShim" ;;
+              cube-envd) add_component "cube-envd" ;;
               cubecow) add_component "cubecow" ;;
               cubelog) add_component "cubelog" ;;
               cubedb) add_component "cubedb" ;;
@@ -182,6 +187,9 @@ jobs:
                 CubeShim/*)
                   add_component "CubeShim"
                   ;;
+                cube-envd/*)
+                  add_component "cube-envd"
+                  ;;
                 CubeNet/cubevs/*)
                   # cubevs is its own Go module with its own unit tests; run
                   # those, and keep cubelet (it embeds the cubevs runtime).
@@ -232,6 +240,7 @@ jobs:
                     elif . == "CubeProxy" then "CubeProxy"
                     elif . == "CubeMaster" then "CubeMaster"
                     elif . == "CubeShim" then "CubeShim"
+                    elif . == "cube-envd" then "Cube-envd"
                     elif . == "cubecow" then "CubeCow"
                     elif . == "cubelog" then "CubeLog"
                     elif . == "cubedb" then "CubeDB"
@@ -249,6 +258,7 @@ jobs:
                     elif . == "CubeProxy" then "cube-proxy-test"
                     elif . == "CubeMaster" then "cubemaster-test"
                     elif . == "CubeShim" then "shim-test"
+                    elif . == "cube-envd" then "cube-envd-test"
                     elif . == "cubecow" then "cubecow-test-native"
                     elif . == "cubelog" then "cubelog-test"
                     elif . == "cubedb" then "cubedb-test"

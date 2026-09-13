@@ -15,10 +15,28 @@ with `envd` preinstalled on `:49983`, so any image built `FROM` it is
 already ready for Cube's readiness probe. Published as
 `ghcr.io/tencentcloud/cubesandbox-base` by
 [`.github/workflows/build-envd-base-image.yml`](../.github/workflows/build-envd-base-image.yml),
-which compiles `envd` in-place from
-[`e2b-dev/infra`](https://github.com/e2b-dev/infra) at tag `2026.16`
-(override via `workflow_dispatch` input `envd_ref`) before baking the
-image.
+which compiles the local Rust `cube-envd` with Rust 1.89 by default.
+Use `ENVD_IMPL=upstream-e2b` to select
+`Dockerfile.cube-base-upstream` and restore the upstream Go build.
+
+Build locally from the repository root:
+
+```bash
+make build-cube-base-image
+make smoke-cube-base-image
+```
+
+The entrypoint writes envd logs to `/var/log/envd.log` by default. Set
+`ENVD_LOG_FILE=-` to send them to the container output, and use
+`ENVD_LOG_LEVEL=warn` or `ENVD_LOG_FORMAT=json` to control verbosity and
+format. The read-only `GET /status` endpoint reports readiness, version,
+commit, port, and uptime; `GET /health` remains the `204` readiness probe.
+Requests may provide `X-Request-ID`; envd echoes it in the response and adds
+it to request logs, or generates a safe `cube-envd-<pid>-<sequence>` value.
+When a user command is running, the entrypoint monitors envd and logs an
+unexpected envd exit before terminating the user command.
+
+The workflow dispatch input `envd_impl` selects the same two implementations.
 
 Minimal consumer example:
 

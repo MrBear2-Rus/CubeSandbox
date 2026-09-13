@@ -2,3 +2,14 @@
 !.dockerignore
 !docker/
 !docker/Dockerfile.builder
+!docker/Dockerfile.cube-base
+!docker/Dockerfile.cube-base-upstream
+!docker/cube-entrypoint.sh
+!cube-envd/
+!cube-envd/Cargo.toml
+!cube-envd/Cargo.lock
+!cube-envd/build.rs
+!cube-envd/rust-toolchain.toml
+!cube-envd/src/
+!cube-envd/src/**
+cube-envd/target/
