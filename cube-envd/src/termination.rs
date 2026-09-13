@@ -69,22 +69,12 @@ impl TerminationInfo {
     }
 }
 
-#[cfg(unix)]
 pub(crate) fn from_exit_status(status: ExitStatus, oom_killed: bool) -> TerminationInfo {
     use std::os::unix::process::ExitStatusExt;
 
     if let Some(signal) = status.signal() {
         TerminationInfo::signal(signal, status.core_dumped(), oom_killed)
     } else if status.code().is_some() {
-        TerminationInfo::exited()
-    } else {
-        TerminationInfo::unknown()
-    }
-}
-
-#[cfg(not(unix))]
-pub(crate) fn from_exit_status(status: ExitStatus, _oom_killed: bool) -> TerminationInfo {
-    if status.code().is_some() {
         TerminationInfo::exited()
     } else {
         TerminationInfo::unknown()

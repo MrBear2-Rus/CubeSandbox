@@ -1,6 +1,6 @@
 use crate::{
     connect::{decode_frame, encode_end_stream, encode_stream_message, ConnectError},
-    filesystem,
+    filesystem, fsutil,
 };
 use axum::{
     body::{Body, Bytes},
@@ -54,14 +54,14 @@ pub async fn watch_dir(headers: HeaderMap, body: Bytes) -> Response {
     };
     let username = match filesystem::request_user(&headers) {
         Ok(username) => username,
-        Err(error) => return filesystem::fs_error_response(error),
+        Err(error) => return fsutil::fs_error_response(error),
     };
     let path = match filesystem::existing_path(&request.path) {
         Ok(path) => path,
-        Err(error) => return filesystem::fs_error_response(error),
+        Err(error) => return fsutil::fs_error_response(error),
     };
     if let Err(error) = filesystem::validate_directory(&path, &username) {
-        return filesystem::fs_error_response(error);
+        return fsutil::fs_error_response(error);
     }
 
     let inotify = match Inotify::init() {

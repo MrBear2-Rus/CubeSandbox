@@ -1,3 +1,4 @@
+use crate::fsutil;
 use axum::{
     body::{to_bytes, Body},
     extract::{FromRequest, Multipart, Query, Request},
@@ -6,13 +7,11 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
-use std::{
-    fs, io,
-    path::{Path, PathBuf},
-    time::UNIX_EPOCH,
-};
+use std::{fs, io, path::Path, time::UNIX_EPOCH};
 
-const MAX_FILE_BODY_SIZE: usize = 64 * 1024 * 1024;
+/// Maximum request body accepted by `POST /files`, enforced for raw and
+/// multipart uploads (the router installs the same limit as a body cap).
+pub(crate) const MAX_FILE_BODY_SIZE: usize = 64 * 1024 * 1024;
 
 #[derive(serde::Serialize)]
 struct UploadEntry {
@@ -28,53 +27,69 @@ pub(crate) struct FileQuery {
     username: Option<String>,
 }
 
+enum FileReadOutcome {
+    Read(FileRead),
+    TooLarge,
+}
+
+struct FileRead {
+    data: Vec<u8>,
+    last_modified: String,
+    modified_seconds: u64,
+}
+
 pub async fn get(headers: HeaderMap, Query(query): Query<FileQuery>) -> Response {
-    let path = match fs::canonicalize(&query.path) {
-        Ok(path) => path,
-        Err(error) => return fs_error_response(error),
+    let outcome = match fsutil::run_blocking(move || read_file(query)).await {
+        Ok(outcome) => outcome,
+        Err(error) => return fsutil::fs_error_response(error),
     };
-    let username = query.username.as_deref().unwrap_or("root");
-    if let Err(error) = check_read_permission(&path, username) {
-        return fs_error_response(error);
-    }
-    let metadata = match fs::metadata(&path) {
-        Ok(metadata) => metadata,
-        Err(error) => return fs_error_response(error),
-    };
-    if metadata.len() > MAX_FILE_BODY_SIZE as u64 {
-        return request_error_response(
+    match outcome {
+        FileReadOutcome::TooLarge => request_error_response(
             StatusCode::PAYLOAD_TOO_LARGE,
             format!("file exceeds the {} byte limit", MAX_FILE_BODY_SIZE),
-        );
+        ),
+        FileReadOutcome::Read(read) => build_read_response(&headers, read),
     }
-    let modified = match modified_seconds(&metadata) {
-        Ok(modified) => modified,
-        Err(error) => return fs_error_response(error),
-    };
-    let last_modified = format_http_date(modified);
+}
+
+fn read_file(query: FileQuery) -> io::Result<FileReadOutcome> {
+    let path = fs::canonicalize(&query.path)?;
+    let username = query.username.as_deref().unwrap_or("root");
+    check_read_permission(&path, username)?;
+    let metadata = fs::metadata(&path)?;
+    if metadata.len() > MAX_FILE_BODY_SIZE as u64 {
+        return Ok(FileReadOutcome::TooLarge);
+    }
+    let modified_seconds = modified_seconds(&metadata)?;
+    let last_modified = format_http_date(modified_seconds);
+    let data = fs::read(&path)?;
+    Ok(FileReadOutcome::Read(FileRead {
+        data,
+        last_modified,
+        modified_seconds,
+    }))
+}
+
+fn build_read_response(headers: &HeaderMap, read: FileRead) -> Response {
     if let Some(value) = headers.get(header::IF_MODIFIED_SINCE) {
         if let Ok(value) = value.to_str() {
-            if parse_http_date(value).is_some_and(|requested| requested >= modified) {
+            if parse_http_date(value).is_some_and(|requested| requested >= read.modified_seconds) {
                 return response_with_file_headers(
                     StatusCode::NOT_MODIFIED,
-                    &last_modified,
+                    &read.last_modified,
                     None,
                     Body::empty(),
                 );
             }
         }
     }
-    let data = match fs::read(&path) {
-        Ok(data) => data,
-        Err(error) => return fs_error_response(error),
-    };
-    let range = match parse_range(headers.get(header::RANGE), data.len()) {
+    let range = match parse_range(headers.get(header::RANGE), read.data.len()) {
         Ok(range) => range,
         Err(()) => {
             return response_with_file_headers(
                 StatusCode::RANGE_NOT_SATISFIABLE,
-                &last_modified,
-                Some(format!("bytes */{}", data.len())),
+                &read.last_modified,
+                Some(format!("bytes */{}", read.data.len())),
                 Body::empty(),
             )
         }
@@ -82,11 +97,16 @@ pub async fn get(headers: HeaderMap, Query(query): Query<FileQuery>) -> Response
     match range {
         Some((start, end)) => response_with_file_headers(
             StatusCode::PARTIAL_CONTENT,
-            &last_modified,
-            Some(format!("bytes {start}-{end}/{}", data.len())),
-            Body::from(data[start..=end].to_vec()),
+            &read.last_modified,
+            Some(format!("bytes {start}-{end}/{}", read.data.len())),
+            Body::from(read.data[start..=end].to_vec()),
         ),
-        None => response_with_file_headers(StatusCode::OK, &last_modified, None, Body::from(data)),
+        None => response_with_file_headers(
+            StatusCode::OK,
+            &read.last_modified,
+            None,
+            Body::from(read.data),
+        ),
     }
 }
 
@@ -185,9 +205,14 @@ pub async fn post(request: Request) -> Response {
             "path query parameter is required".to_owned(),
         );
     }
-    let username = query.username.as_deref().unwrap_or("root");
-    if let Err(error) = validate_username(username) {
-        return fs_error_response(error);
+    let username = query.username.as_deref().unwrap_or("root").to_owned();
+    if let Err(error) = fsutil::run_blocking({
+        let username = username.clone();
+        move || fsutil::validate_username(&username)
+    })
+    .await
+    {
+        return fsutil::fs_error_response(error);
     }
 
     let is_multipart = request
@@ -247,174 +272,74 @@ pub async fn post(request: Request) -> Response {
         }
     };
 
-    let path = match writable_path(&query.path) {
-        Ok(path) => path,
-        Err(error) => return fs_error_response(error),
-    };
-    if let Some(parent) = path.parent() {
-        if let Err(error) = fs::create_dir_all(parent) {
-            return fs_error_response(error);
+    let path = query.path;
+    let result = fsutil::run_blocking(move || {
+        let path = fsutil::writable_path(&path)?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
         }
-    }
-    if let Err(error) = write_file(&path, &data) {
-        return fs_error_response(error);
-    }
-    if let Err(error) = apply_owner(&path, username) {
-        return fs_error_response(error);
-    }
-    let entry = UploadEntry {
-        name: path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or_default()
-            .to_owned(),
-        path: path.to_string_lossy().into_owned(),
-        file_type: "file",
-    };
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
-        .body(Body::from(
-            serde_json::to_string(&[entry]).expect("upload entry is serializable"),
-        ))
-        .expect("valid upload response")
-}
+        write_file(&path, &data)?;
+        fsutil::apply_owner(&path, &username)?;
+        Ok(UploadEntry {
+            name: path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+                .to_owned(),
+            path: path.to_string_lossy().into_owned(),
+            file_type: "file",
+        })
+    })
+    .await;
 
-fn writable_path(raw_path: &str) -> io::Result<PathBuf> {
-    let requested = lexical_normalize(Path::new(raw_path));
-    if requested.exists() {
-        return fs::canonicalize(requested);
+    match result {
+        Ok(entry) => Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+            .body(Body::from(
+                serde_json::to_string(&[entry]).expect("upload entry is serializable"),
+            ))
+            .expect("valid upload response"),
+        Err(error) => fsutil::fs_error_response(error),
     }
-
-    let mut missing = Vec::new();
-    let mut current = requested.as_path();
-    while !current.exists() {
-        let name = current.file_name().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "path has no existing parent")
-        })?;
-        missing.push(name.to_owned());
-        current = current.parent().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "path has no existing parent")
-        })?;
-    }
-    let mut resolved = fs::canonicalize(current)?;
-    for component in missing.iter().rev() {
-        resolved.push(component);
-    }
-    Ok(resolved)
-}
-
-fn lexical_normalize(path: &Path) -> PathBuf {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-            std::path::Component::RootDir => normalized.push(Path::new("/")),
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                if !normalized.pop() && !path.is_absolute() {
-                    normalized.push("..");
-                }
-            }
-            std::path::Component::Normal(component) => normalized.push(component),
-        }
-    }
-    normalized
 }
 
 fn write_file(path: &Path, data: &[u8]) -> io::Result<()> {
     fs::write(path, data)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o644))?;
-    }
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o644))?;
     Ok(())
 }
 
-fn validate_username(username: &str) -> io::Result<()> {
+fn check_read_permission(path: &Path, username: &str) -> io::Result<()> {
+    fsutil::validate_username(username)?;
     if username.is_empty() || username == "root" {
         return Ok(());
     }
-    #[cfg(unix)]
-    if nix::unistd::User::from_name(username)
+    use std::os::unix::fs::MetadataExt;
+    let user = nix::unistd::User::from_name(username)
         .map_err(|error| io::Error::other(error.to_string()))?
-        .is_none()
-    {
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "user not found"))?;
+    let metadata = fs::metadata(path)?;
+    let mode = metadata.mode();
+    let readable = if metadata.uid() == user.uid.as_raw() {
+        mode & 0o400 != 0
+    } else if metadata.gid() == user.gid.as_raw() {
+        mode & 0o040 != 0
+    } else {
+        mode & 0o004 != 0
+    };
+    if !readable {
         return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("user {username} not found"),
+            io::ErrorKind::PermissionDenied,
+            format!("user {username} cannot read {}", path.display()),
         ));
     }
     Ok(())
 }
 
-fn check_read_permission(path: &Path, username: &str) -> io::Result<()> {
-    validate_username(username)?;
-    if username.is_empty() || username == "root" {
-        return Ok(());
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let user = nix::unistd::User::from_name(username)
-            .map_err(|error| io::Error::other(error.to_string()))?
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "user not found"))?;
-        let metadata = fs::metadata(path)?;
-        let mode = metadata.mode();
-        let readable = if metadata.uid() == user.uid.as_raw() {
-            mode & 0o400 != 0
-        } else if metadata.gid() == user.gid.as_raw() {
-            mode & 0o040 != 0
-        } else {
-            mode & 0o004 != 0
-        };
-        if !readable {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!("user {username} cannot read {}", path.display()),
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn apply_owner(path: &Path, username: &str) -> io::Result<()> {
-    if username.is_empty() || username == "root" {
-        return Ok(());
-    }
-    #[cfg(unix)]
-    {
-        let user = nix::unistd::User::from_name(username)
-            .map_err(|error| io::Error::other(error.to_string()))?
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "user not found"))?;
-        nix::unistd::chown(path, Some(user.uid), Some(user.gid))
-            .map_err(|error| io::Error::other(error.to_string()))?;
-    }
-    Ok(())
-}
-
-fn fs_error_response(error: io::Error) -> Response {
-    let (status, code) = match error.kind() {
-        io::ErrorKind::NotFound => (StatusCode::NOT_FOUND, "not_found"),
-        io::ErrorKind::PermissionDenied => (StatusCode::FORBIDDEN, "permission_denied"),
-        io::ErrorKind::InvalidInput => (StatusCode::BAD_REQUEST, "invalid_argument"),
-        _ => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
-    };
-    error_response_with_code(status, code, error.to_string())
-}
-
 fn request_error_response(status: StatusCode, message: String) -> Response {
-    error_response_with_code(status, "invalid_argument", message)
-}
-
-fn error_response_with_code(status: StatusCode, code: &str, message: String) -> Response {
-    let payload = serde_json::json!({"code": code, "message": message});
-    Response::builder()
-        .status(status)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(payload.to_string()))
-        .expect("valid file error response")
+    fsutil::error_response_with_code(status, "invalid_argument", message)
 }
 
 #[cfg(test)]

@@ -1,6 +1,8 @@
 use crate::connect::{decode_frame, encode_end_stream, encode_stream_message};
+use crate::defaults::Defaults;
 use crate::process::connect_timeout;
 use crate::termination::{self, CgroupMemoryMonitor, TerminationInfo};
+use crate::AppState;
 use axum::{
     body::Body,
     http::{header, HeaderMap, StatusCode},
@@ -149,13 +151,18 @@ struct PtyEndEvent {
     termination: Option<TerminationInfo>,
 }
 
-pub async fn start(headers: HeaderMap, body: bytes::Bytes) -> Response {
+pub async fn start(state: Arc<AppState>, headers: HeaderMap, body: bytes::Bytes) -> Response {
     let request = match decode_request::<PtyStartRequest>(&body) {
         Ok(request) => request,
         Err(error) => return error_response(StatusCode::BAD_REQUEST, error),
     };
     let size = pty_size(request.pty.size);
-    let command = match build_command(request.process) {
+    let defaults = state
+        .defaults
+        .read()
+        .expect("defaults lock poisoned")
+        .clone();
+    let command = match build_command(request.process, &defaults) {
         Ok(command) => command,
         Err(error) => return error_response(StatusCode::BAD_REQUEST, error.to_string()),
     };
@@ -197,23 +204,12 @@ pub async fn send_signal(body: bytes::Bytes) -> Response {
         Some(session) => session,
         None => return not_found_response(),
     };
-    #[cfg(unix)]
-    {
-        use nix::{
-            sys::signal::{kill, Signal},
-            unistd::Pid,
-        };
-        if let Err(error) = kill(Pid::from_raw(session.pid as i32), Signal::SIGKILL) {
-            return error_response(StatusCode::INTERNAL_SERVER_ERROR, error.to_string());
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = session;
-        return error_response(
-            StatusCode::NOT_IMPLEMENTED,
-            "signals are only supported on Unix".to_owned(),
-        );
+    use nix::{
+        sys::signal::{kill, Signal},
+        unistd::Pid,
+    };
+    if let Err(error) = kill(Pid::from_raw(session.pid as i32), Signal::SIGKILL) {
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, error.to_string());
     }
     empty_response()
 }
@@ -323,13 +319,10 @@ fn schedule_timeout(session: Arc<PtySession>, timeout: Option<Duration>) {
             return;
         }
         session.timed_out.store(true, Ordering::Release);
-        #[cfg(unix)]
-        {
-            let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(session.pid as i32),
-                nix::sys::signal::Signal::SIGKILL,
-            );
-        }
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(session.pid as i32),
+            nix::sys::signal::Signal::SIGKILL,
+        );
     });
 }
 
@@ -372,7 +365,6 @@ fn spawn_pty_worker(
     });
 }
 
-#[cfg(unix)]
 fn wait_for_pty_child(
     pid: u32,
     _child: Box<dyn portable_pty::Child + Send>,
@@ -380,18 +372,6 @@ fn wait_for_pty_child(
     nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(pid as i32), None)
 }
 
-#[cfg(not(unix))]
-fn wait_for_pty_child(
-    _pid: u32,
-    child: Box<dyn portable_pty::Child + Send>,
-) -> io::Result<portable_pty::ExitStatus> {
-    let mut child = child;
-    child
-        .wait()
-        .map_err(|error| io::Error::other(error.to_string()))
-}
-
-#[cfg(unix)]
 fn pty_end_event(
     status: nix::sys::wait::WaitStatus,
     oom_killed: bool,
@@ -454,27 +434,6 @@ fn pty_end_event(
                 termination: TerminationInfo::unknown(),
             }
         }
-    }
-}
-
-#[cfg(not(unix))]
-fn pty_end_event(status: portable_pty::ExitStatus, _oom_killed: bool, timed_out: bool) -> PtyEvent {
-    let exit_code = status.exit_code() as i32;
-    let text = format!("exit status {exit_code}");
-    PtyEvent::End {
-        exit_code: (!timed_out).then_some(exit_code),
-        exited: !timed_out,
-        status: text.clone(),
-        error: if timed_out {
-            Some("process timed out".to_owned())
-        } else {
-            (exit_code != 0).then_some(text)
-        },
-        termination: if timed_out {
-            TerminationInfo::timeout()
-        } else {
-            TerminationInfo::exited()
-        },
     }
 }
 
@@ -591,19 +550,21 @@ async fn send_pty_event(
     true
 }
 
-fn build_command(process: PtyProcessConfig) -> io::Result<CommandBuilder> {
+fn build_command(process: PtyProcessConfig, defaults: &Defaults) -> io::Result<CommandBuilder> {
     if process.cmd.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "PTY command is empty",
         ));
     }
+    let envs = defaults.merged_env_vars(&process.envs);
+    let cwd = process.cwd.or_else(|| defaults.workdir());
     let mut command = CommandBuilder::new(process.cmd);
     command.args(process.args);
-    for (key, value) in process.envs {
+    for (key, value) in envs {
         command.env(key, value);
     }
-    if let Some(cwd) = process.cwd {
+    if let Some(cwd) = cwd {
         command.cwd(cwd);
     }
     Ok(command)
@@ -674,6 +635,10 @@ fn error_response_with_code(status: StatusCode, code: &str, message: &str) -> Re
 mod tests {
     use super::*;
 
+    fn test_state() -> Arc<AppState> {
+        Arc::new(AppState::new(49983))
+    }
+
     async fn collect_stream(response: Response) -> Vec<serde_json::Value> {
         let mut stream = response.into_body().into_data_stream();
         let mut frames = Vec::new();
@@ -692,7 +657,7 @@ mod tests {
         let body = bytes::Bytes::from(encode_stream_message(
             br#"{"process":{"cmd":"/bin/bash","args":["-c","printf hello"]},"pty":{"size":{"rows":24,"cols":80}}}"#,
         ));
-        let frames = collect_stream(start(HeaderMap::new(), body).await).await;
+        let frames = collect_stream(start(test_state(), HeaderMap::new(), body).await).await;
         assert!(
             frames.first().unwrap()["event"]["start"]["pid"]
                 .as_u64()
@@ -714,7 +679,7 @@ mod tests {
         let body = bytes::Bytes::from(encode_stream_message(
             br#"{"process":{"cmd":"/bin/bash","args":["-i"]},"pty":{"size":{"rows":24,"cols":80}}}"#,
         ));
-        let response = start(HeaderMap::new(), body).await;
+        let response = start(test_state(), HeaderMap::new(), body).await;
         let mut stream = response.into_body().into_data_stream();
         let first = stream.next().await.unwrap().unwrap();
         let (_, payload) = decode_frame(&first).unwrap();
@@ -772,7 +737,7 @@ mod tests {
         let body = bytes::Bytes::from(encode_stream_message(
             br#"{"process":{"cmd":"/bin/bash","args":["-c","sleep 2"]},"pty":{"size":{"rows":24,"cols":80}}}"#,
         ));
-        let response = start(HeaderMap::new(), body).await;
+        let response = start(test_state(), HeaderMap::new(), body).await;
         let mut stream = response.into_body().into_data_stream();
         let first = stream.next().await.unwrap().unwrap();
         let (_, payload) = decode_frame(&first).unwrap();

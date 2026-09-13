@@ -28,10 +28,13 @@ and sandbox data-plane requests route to the virtual host
 
 ## Compatibility
 
-Implemented endpoints are `/health`, all five `/process.Process/*` operations,
-all six `/filesystem.Filesystem/*` operations, and GET/POST `/files`. The
-`/files` handler supports raw and multipart writes, CORS preflight, Range,
-`Last-Modified`, `If-Modified-Since`, `304`, and `416` behavior.
+Implemented endpoints are `/health`, `/status`, `/init`, all five
+`/process.Process/*` operations, all six `/filesystem.Filesystem/*`
+operations, and GET/POST `/files`. The `/files` handler supports raw and
+multipart writes, CORS preflight, Range, `Last-Modified`, `If-Modified-Since`,
+`304`, and `416` behavior. `POST /init` applies process-wide `envVars`,
+`defaultUser`, and `defaultWorkdir` to later process/PTY spawns, matching the
+upstream envd bootstrap path that Cubelet drives for `create_time_env_vars`.
 
 ## Known differences
 
@@ -47,8 +50,11 @@ all six `/filesystem.Filesystem/*` operations, and GET/POST `/files`. The
 
 ## Validation
 
-- `cargo test --release`: 31/31 passed.
+- `cargo test --release`: 47/47 passed.
 - `cargo clippy --all-targets -- -D warnings`: passed.
+- `scripts/e2e_smoke.py`: all checks green (router-level HTTP + Connect:
+  `/init` env, process exit/signal/timeout, `/files` raw/multipart/range/304,
+  filesystem RPCs, WatchDir, PTY, 24-way concurrency).
 - Docker smoke verified the real image contract, including `/health=204`,
   `/status`, request IDs, request logs, PTY, filesystem, and WatchDir behavior.
 - The Rust/upstream compatibility check passed with six scenarios and a clean
@@ -100,3 +106,4 @@ change is `linux/amd64` only. See `spec §5.1.1` for the migration checklist.
 ## Attribution
 
 Assisted-by: Codex: GPT-5
+Assisted-by: opencode:deepseek-v4.1-flash

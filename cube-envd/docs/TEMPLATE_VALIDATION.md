@@ -212,7 +212,7 @@ committed:
 - `make smoke-cube-base-image CUBE_BASE_PLATFORM=linux/amd64` builds and runs
   the image; envd `/health` returns `204`, and version/commit are non-empty.
 - `cargo test --release` covers Connect framing, process, PTY, filesystem,
-  WatchDir, request IDs, and status behavior.
+  WatchDir, request IDs, status behavior, and `/init` defaults.
 
 ## Troubleshooting
 

@@ -1,6 +1,6 @@
 use axum::{
     body::Bytes,
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::{header, HeaderMap, HeaderValue, Request, StatusCode},
     middleware::Next,
     response::{Json, Response},
@@ -8,13 +8,14 @@ use axum::{
     Router,
 };
 use clap::Parser;
+use defaults::Defaults;
 use serde::Serialize;
 use std::{
     env,
     net::SocketAddr,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, RwLock,
     },
     time::Instant,
 };
@@ -24,8 +25,11 @@ use tracing_subscriber::filter::LevelFilter;
 
 pub mod connect;
 mod cors;
+mod defaults;
 mod files;
 mod filesystem;
+mod fsutil;
+mod init;
 mod process;
 mod pty;
 mod termination;
@@ -34,23 +38,38 @@ mod watch;
 const REQUEST_ID_HEADER: &str = "x-request-id";
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
-async fn process_start_dispatch(headers: HeaderMap, body: Bytes) -> Response {
+async fn process_start_dispatch(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
     let is_pty = connect::decode_frame(&body)
         .ok()
         .and_then(|(_, payload)| serde_json::from_slice::<serde_json::Value>(&payload).ok())
         .and_then(|value| value.get("pty").cloned())
         .is_some();
     if is_pty {
-        pty::start(headers, body).await
+        pty::start(state, headers, body).await
     } else {
-        process::start(headers, body).await
+        process::start(state, headers, body).await
     }
 }
 
 #[derive(Clone)]
-struct AppState {
-    port: u16,
-    started_at: Instant,
+pub(crate) struct AppState {
+    pub(crate) port: u16,
+    pub(crate) started_at: Instant,
+    pub(crate) defaults: Arc<RwLock<Defaults>>,
+}
+
+impl AppState {
+    pub(crate) fn new(port: u16) -> Self {
+        Self {
+            port,
+            started_at: Instant::now(),
+            defaults: Arc::new(RwLock::new(Defaults::default())),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -222,10 +241,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let address = SocketAddr::from(([0, 0, 0, 0], cli.port));
     let listener = TcpListener::bind(address).await?;
-    let state = Arc::new(AppState {
-        port: cli.port,
-        started_at: Instant::now(),
-    });
+    let state = Arc::new(AppState::new(cli.port));
     info!(
         %address,
         service = "cube-envd",
@@ -237,6 +253,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = Router::new()
         .route("/health", get(health))
         .route("/status", get(status))
+        .route("/init", axum::routing::post(init::init))
+        .route("/envs", get(init::envs))
         .route(
             "/process.Process/Start",
             axum::routing::post(process_start_dispatch),
@@ -254,7 +272,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             axum::routing::post(pty::send_input),
         )
         .route("/process.Process/Update", axum::routing::post(pty::update))
-        .route("/files", get(files::get).post(files::post))
+        .route(
+            "/files",
+            get(files::get)
+                .post(files::post)
+                .layer(DefaultBodyLimit::max(files::MAX_FILE_BODY_SIZE)),
+        )
         .route(
             "/filesystem.Filesystem/ListDir",
             axum::routing::post(filesystem::list_dir),
@@ -294,7 +317,7 @@ mod tests {
         LogFormat, StatusResponse, REQUEST_ID_HEADER,
     };
     use axum::http::{HeaderMap, HeaderValue};
-    use std::{sync::Arc, time::Instant};
+    use std::sync::Arc;
 
     #[test]
     fn legacy_flags_are_normalized() {
@@ -325,10 +348,7 @@ mod tests {
 
     #[test]
     fn status_response_uses_stable_contract() {
-        let state = Arc::new(AppState {
-            port: 49983,
-            started_at: Instant::now(),
-        });
+        let state = Arc::new(AppState::new(49983));
         let response = StatusResponse {
             service: "cube-envd",
             ready: true,

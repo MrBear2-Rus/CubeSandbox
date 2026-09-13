@@ -1,5 +1,7 @@
 use crate::connect::{decode_frame, encode_end_stream, encode_stream_message};
+use crate::defaults::Defaults;
 use crate::termination::{self, CgroupMemoryMonitor, TerminationInfo};
+use crate::AppState;
 use axum::{
     body::Body,
     http::{header, HeaderMap, StatusCode},
@@ -7,7 +9,7 @@ use axum::{
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
-use std::{convert::Infallible, io, process::Stdio, time::Duration};
+use std::{convert::Infallible, io, process::Stdio, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
     process::{Child, Command},
@@ -88,13 +90,18 @@ enum ChildOutput {
     ReaderDone,
 }
 
-pub async fn start(headers: HeaderMap, body: bytes::Bytes) -> Response {
+pub async fn start(state: Arc<AppState>, headers: HeaderMap, body: bytes::Bytes) -> Response {
     let request = match decode_request(&body) {
         Ok(request) => request,
         Err(error) => return error_response(StatusCode::BAD_REQUEST, error.to_string()),
     };
 
-    let user = match basic_auth_user(&headers) {
+    let defaults = state
+        .defaults
+        .read()
+        .expect("defaults lock poisoned")
+        .clone();
+    let user = match basic_auth_user(&headers, &defaults) {
         Ok(user) => user,
         Err(error) => return error_response(StatusCode::BAD_REQUEST, error),
     };
@@ -104,7 +111,7 @@ pub async fn start(headers: HeaderMap, body: bytes::Bytes) -> Response {
     };
 
     let oom_monitor = CgroupMemoryMonitor::start();
-    let child = match spawn_process(request, &user) {
+    let child = match spawn_process(request, &user, &defaults) {
         Ok(child) => child,
         Err(error) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
     };
@@ -145,9 +152,9 @@ fn decode_request(
     Ok(serde_json::from_slice(&payload)?)
 }
 
-fn basic_auth_user(headers: &HeaderMap) -> Result<String, String> {
+fn basic_auth_user(headers: &HeaderMap, defaults: &Defaults) -> Result<String, String> {
     let Some(value) = headers.get(header::AUTHORIZATION) else {
-        return Ok("root".to_owned());
+        return Ok(defaults.user_or_root());
     };
     let value = value
         .to_str()
@@ -165,7 +172,7 @@ fn basic_auth_user(headers: &HeaderMap) -> Result<String, String> {
         .map(|(username, _)| username)
         .unwrap_or(credentials.as_str());
     if username.is_empty() {
-        Ok("root".to_owned())
+        Ok(defaults.user_or_root())
     } else {
         Ok(username.to_owned())
     }
@@ -183,19 +190,22 @@ pub(crate) fn connect_timeout(headers: &HeaderMap) -> Result<Option<Duration>, S
     Ok(Some(Duration::from_millis(milliseconds)))
 }
 
-fn spawn_process(request: ProcessStartRequest, user: &str) -> io::Result<Child> {
+fn spawn_process(
+    request: ProcessStartRequest,
+    user: &str,
+    defaults: &Defaults,
+) -> io::Result<Child> {
     let mut command = Command::new(&request.process.cmd);
     command
         .args(&request.process.args)
-        .envs(&request.process.envs)
+        .envs(defaults.merged_env_vars(&request.process.envs))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    if let Some(cwd) = request.process.cwd {
+    if let Some(cwd) = request.process.cwd.or_else(|| defaults.workdir()) {
         command.current_dir(cwd);
     }
 
-    #[cfg(unix)]
     if user != "root" {
         use nix::unistd::{Gid, Uid, User};
         use std::ffi::CString;
@@ -222,18 +232,9 @@ fn spawn_process(request: ProcessStartRequest, user: &str) -> io::Result<Child> 
         }
     }
 
-    #[cfg(not(unix))]
-    if user != "root" {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "user switching is only supported on Unix",
-        ));
-    }
-
     command.spawn()
 }
 
-#[cfg(unix)]
 fn end_event_fields(
     status: std::process::ExitStatus,
     oom_killed: bool,
@@ -259,21 +260,6 @@ fn end_event_fields(
             termination::from_exit_status(status, false),
         )
     }
-}
-
-#[cfg(not(unix))]
-fn end_event_fields(
-    status: std::process::ExitStatus,
-    oom_killed: bool,
-) -> (i32, bool, String, Option<String>, TerminationInfo) {
-    let fields = exit_status_fields(status.code().unwrap_or(-1));
-    (
-        fields.0,
-        fields.1,
-        fields.2,
-        fields.3,
-        termination::from_exit_status(status, oom_killed),
-    )
 }
 
 fn exit_status_fields(exit_code: i32) -> (i32, bool, String, Option<String>) {
@@ -465,6 +451,10 @@ mod tests {
     use super::*;
     use axum::http::HeaderValue;
 
+    fn test_state() -> Arc<AppState> {
+        Arc::new(AppState::new(49983))
+    }
+
     async fn collect_response(response: Response) -> Vec<serde_json::Value> {
         let mut body = response.into_body().into_data_stream();
         let mut frames = Vec::new();
@@ -487,7 +477,7 @@ mod tests {
         let body = bytes::Bytes::from(encode_stream_message(
             br#"{"process":{"cmd":"/bin/bash","args":["-c","echo -n hello; echo -n world >&2; exit 42"]},"stdin":false}"#,
         ));
-        let frames = collect_response(start(headers, body).await).await;
+        let frames = collect_response(start(test_state(), headers, body).await).await;
         assert!(
             frames.first().unwrap()["event"]["start"]["pid"]
                 .as_u64()
@@ -533,7 +523,7 @@ mod tests {
         let body = bytes::Bytes::from(encode_stream_message(
             br#"{"process":{"cmd":"/bin/sh","args":["-c","kill -9 $$"]}}"#,
         ));
-        let frames = collect_response(start(headers, body).await).await;
+        let frames = collect_response(start(test_state(), headers, body).await).await;
         let end = &frames.last().unwrap()["event"]["end"];
         assert_eq!(end["exitCode"], -1);
         assert_eq!(end["exited"], false);
@@ -551,7 +541,7 @@ mod tests {
         let body = bytes::Bytes::from(encode_stream_message(
             br#"{"process":{"cmd":"/bin/bash","args":["-c","sleep 2"]}}"#,
         ));
-        let frames = collect_response(start(headers, body).await).await;
+        let frames = collect_response(start(test_state(), headers, body).await).await;
         assert_eq!(
             frames.last().unwrap()["event"]["end"]["error"],
             "process timed out"
@@ -582,7 +572,7 @@ mod tests {
         let body = bytes::Bytes::from(encode_stream_message(
             br#"{"process":{"cmd":"/bin/bash","args":["-c","id -u"]}}"#,
         ));
-        let frames = collect_response(start(headers, body).await).await;
+        let frames = collect_response(start(test_state(), headers, body).await).await;
         let stdout = frames
             .iter()
             .filter_map(|frame| frame["event"]["data"]["stdout"].as_str())
