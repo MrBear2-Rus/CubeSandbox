@@ -27,10 +27,26 @@ pub async fn layer(request: Request, next: Next) -> Response {
 }
 
 fn token_matches(provided: Option<&str>, expected: Option<&str>) -> bool {
-    match expected {
-        None => true,
-        Some(expected) => provided == Some(expected),
+    let Some(expected) = expected else {
+        return true;
+    };
+    let Some(provided) = provided else {
+        return false;
+    };
+    constant_time_eq(provided.as_bytes(), expected.as_bytes())
+}
+
+/// Compare without an early exit on the first mismatching byte, so the token
+/// check does not leak how many leading bytes matched.
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
     }
+    let mut difference = 0u8;
+    for (a, b) in left.iter().zip(right) {
+        difference |= a ^ b;
+    }
+    difference == 0
 }
 
 fn unauthorized() -> Response {
@@ -56,6 +72,14 @@ mod tests {
         assert!(token_matches(Some("x"), Some("x")));
         assert!(!token_matches(None, Some("x")));
         assert!(!token_matches(Some("y"), Some("x")));
+    }
+
+    #[test]
+    fn constant_time_eq_matches_only_equal_bytes() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(constant_time_eq(b"", b""));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"ab"));
     }
 
     #[test]

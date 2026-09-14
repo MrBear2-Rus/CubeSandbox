@@ -58,8 +58,13 @@ SHUTTING_DOWN=0
 process_is_running() {
     pid="$1"
     [ -r "/proc/${pid}/stat" ] || return 1
-    set -- $(cat "/proc/${pid}/stat" 2>/dev/null || true)
-    [ "${3:-}" != "Z" ]
+    stat="$(cat "/proc/${pid}/stat" 2>/dev/null || true)"
+    [ -n "${stat}" ] || return 1
+    # Field 2 (comm) is wrapped in parens and may itself contain spaces or
+    # parens, so resume parsing after the last ')': the next field is state.
+    rest="${stat##*) }"
+    state="${rest%% *}"
+    [ "${state:-}" != "Z" ]
 }
 
 stop_envd() {

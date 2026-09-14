@@ -208,6 +208,8 @@ fn protobuf_codec_requested(headers: &HeaderMap) -> bool {
             | Some("application/connect+proto")
             | Some("application/grpc")
             | Some("application/grpc+proto")
+            | Some("application/grpc-web")
+            | Some("application/grpc-web+proto")
     )
 }
 
@@ -409,8 +411,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             axum::routing::post(watch::remove_watcher),
         )
         .with_state(state)
-        .layer(axum::middleware::from_fn(auth::layer))
         .layer(axum::middleware::from_fn(codec_guard))
+        .layer(axum::middleware::from_fn(auth::layer))
         .layer(axum::middleware::from_fn(request_log))
         .layer(axum::middleware::from_fn(cors::layer));
     axum::serve(listener, app).await?;
@@ -586,6 +588,8 @@ mod tests {
             "application/connect+proto",
             "application/grpc",
             "application/grpc+proto",
+            "application/grpc-web",
+            "application/grpc-web+proto",
             "application/proto; charset=utf-8",
             "Application/Proto",
         ] {

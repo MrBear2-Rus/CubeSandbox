@@ -41,26 +41,35 @@ data-plane requests route to `49983-<sandboxID>.<domain>`.
 
 Implemented: `GET /health` (204), `GET /status`, `POST /init`, `GET /envs`,
 `GET /metrics`, `GET/POST /files`, `process.Process/{Start,Connect,SendSignal,
-SendInput,Update,List}`, and `filesystem.Filesystem/{Stat,ListDir,MakeDir,Move,
-Remove,WatchDir,CreateWatcher,GetWatcherEvents,RemoveWatcher}`.
+SendInput,StreamInput,CloseStdin,Update,List}`, and
+`filesystem.Filesystem/{Stat,ListDir,MakeDir,Move,Remove,WatchDir,CreateWatcher,
+GetWatcherEvents,RemoveWatcher}`.
 
 `EntryInfo` uses upstream field names and `FILE_TYPE_{FILE,DIRECTORY,SYMLINK}`;
 symlinks are reported with `lstat` semantics plus `symlinkTarget`.
 
 REST `/files`: raw and multipart writes, CORS preflight, Range, `Last-Modified`,
-`If-Modified-Since`, `304`, `416`, 64 MiB upload cap.
+`If-Modified-Since`, `304`, `416`, 64 MiB upload cap. Multi-range requests serve
+the whole file with `200`; only identity encoding is offered, and an
+`Accept-Encoding` that refuses identity gets `406`. `/files/compose` stays in the
+route table and answers `501 unimplemented` rather than a misleading `404`.
 
 ## Known differences
 
-- `Process.Start` runs with `stdin=false`; interactive input goes through the
-  PTY API.
-- PTY signal exits report `exitCode = 128 + signal` (upstream Go reports `-1`);
-  `status`/`error` strings and `exited=false` match upstream.
+- `Process.Start` allocates a piped stdin by default (`stdin:false` opts out);
+  `StreamInput` and `CloseStdin` (and the `stdin` arm of `SendInput`) drive it.
+- PTY signal exits report `exitCode = -1` with `status`/`error` of
+  `signal: <name>` and `exited=false`, matching upstream; a signal-killed
+  process never reports `128 + signal`.
 - End events additionally carry `termination{reason,signal,signalName,
   coreDumped}`; cgroup `memory.events` / `memory.oom_control` deltas distinguish
   OOM kills from ordinary SIGKILLs (`memory.failcnt` fallback).
-- The Connect binary-protobuf codec is not implemented; all SDKs use JSON.
-- `/files/compose`, gzip download, and signature verification are not
+- The Connect binary-protobuf codec is not implemented: requests that ask for it
+  (`application/proto`, `application/connect+proto`, `application/grpc*`) are
+  rejected up front with `501 unimplemented` naming the JSON codec. The SDKs in
+  this repository send `application/connect+json`; the official E2B clients are
+  not covered by that statement.
+- gzip download encoding and `/files` signature verification are not
   implemented.
 - WatchDir covers inotify create/remove/write/rename/chmod mappings;
   `CreateWatcher` performs an initial recursive scan but does not auto-watch
@@ -69,7 +78,7 @@ REST `/files`: raw and multipart writes, CORS preflight, Range, `Last-Modified`,
 
 ## Validation
 
-- `cargo test --release`: **93 passed**.
+- `cargo test --release`: **107 passed**.
 - `cargo clippy --release --all-targets -- -D warnings`: clean.
 - `cargo fmt --check`: clean.
 - `scripts/e2e_smoke.py`: all checks green (health/status, `/init`/`/envs`,
@@ -77,7 +86,9 @@ REST `/files`: raw and multipart writes, CORS preflight, Range, `Last-Modified`,
   `206`/`416`/`304`, filesystem lifecycle, WatchDir, watch family, PTY+List,
   24-way concurrency, token auth, CLI flag tolerance).
 - `scripts/conformance.py`: 18 normalized cases match the checked-in baseline
-  (`scripts/conformance.baseline.json`).
+  (`scripts/conformance.baseline.json`). This is a **regression snapshot**, not a
+  diff against real upstream envd output, so it shows "no regression against the
+  recorded baseline" rather than upstream byte-parity.
 - `scripts/scenarios.py`: the three required scenarios pass, with results in
   [`docs/SCENARIOS.md`](SCENARIOS.md).
 - Base image: `docker/Dockerfile.cube-base` builds and `/health` returns `204`
@@ -93,9 +104,9 @@ REST `/files`: raw and multipart writes, CORS preflight, Range, `Last-Modified`,
 
 | # | Criterion | Status |
 |---|---|---|
-| 1 | Starts in the sandbox, health check passes, behavior close to upstream envd | ✅ Local (93 tests, e2e, conformance, base-image smoke) |
+| 1 | Starts in the sandbox, health check passes, behavior close to upstream envd | ✅ Local (107 tests, e2e, regression snapshot, base-image smoke) |
 | 2 | Commands and file read/write via the CubeSandbox SDK | ✅ Local (`sdk/go/envd_local_test.go` drives the real SDK against a local cube-envd container; live-cluster run also covered by the SDK contract tests) |
-| 3 | A template built from cube-envd creates and becomes usable | ⚠️ Base image built + readiness smoke; live BuildTemplate/Create needs a CubeMaster/CubeAPI/Cubelet cluster (`docs/TEMPLATE_VALIDATION.md`) |
+| 3 | A template built from cube-envd creates and becomes usable | ✅ Local single-node CubeSandbox (WSL2): build → READY → sandbox → commands/files via the Go SDK (`docs/TEMPLATE_VALIDATION.md`) |
 | 4 | At least 3 scenarios with results + logs | ✅ `scripts/scenarios.py` → `docs/SCENARIOS.md` |
 | 5 | Build path defaults to cube-envd with a clear switch/rollback | ✅ `Makefile` + Dockerfiles + `ENVD_IMPL` |
 | 6 | PR describing design, compatibility scope, known differences | ✅ this document |

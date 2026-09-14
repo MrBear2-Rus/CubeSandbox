@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 use std::io;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use tokio::io::AsyncWriteExt;
 use tokio::process::ChildStdin;
+use tokio::sync::Mutex as AsyncMutex;
 
 /// A running process (or PTY) tracked so `process.Process/List` can report it.
 #[derive(Clone, Debug)]
@@ -53,8 +54,10 @@ pub(crate) fn pid_for_tag(tag: &str) -> Option<u32> {
         .map(|(pid, _)| *pid)
 }
 
-fn stdin_registry() -> &'static Mutex<HashMap<u32, ChildStdin>> {
-    static STDIN: OnceLock<Mutex<HashMap<u32, ChildStdin>>> = OnceLock::new();
+type SharedStdin = Arc<AsyncMutex<ChildStdin>>;
+
+fn stdin_registry() -> &'static Mutex<HashMap<u32, SharedStdin>> {
+    static STDIN: OnceLock<Mutex<HashMap<u32, SharedStdin>>> = OnceLock::new();
     STDIN.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -63,29 +66,28 @@ pub(crate) fn register_stdin(pid: u32, writer: ChildStdin) {
     stdin_registry()
         .lock()
         .expect("stdin registry lock poisoned")
-        .insert(pid, writer);
+        .insert(pid, Arc::new(AsyncMutex::new(writer)));
 }
 
 /// Write a chunk of stdin. Returns `false` when the process has no piped
 /// stdin (either it opted out with `stdin:false` or it already exited).
+///
+/// The writer is shared behind an async mutex and never removed here, so two
+/// overlapping `StreamInput` frames serialize instead of the second seeing a
+/// missing writer.
 pub(crate) async fn write_stdin(pid: u32, data: &[u8]) -> io::Result<bool> {
     let writer = stdin_registry()
         .lock()
         .expect("stdin registry lock poisoned")
-        .remove(&pid);
-    let Some(mut writer) = writer else {
+        .get(&pid)
+        .cloned();
+    let Some(writer) = writer else {
         return Ok(false);
     };
-    let result = async {
-        writer.write_all(data).await?;
-        writer.flush().await
-    }
-    .await;
-    stdin_registry()
-        .lock()
-        .expect("stdin registry lock poisoned")
-        .insert(pid, writer);
-    result.map(|_| true)
+    let mut writer = writer.lock().await;
+    writer.write_all(data).await?;
+    writer.flush().await?;
+    Ok(true)
 }
 
 /// Drop the child's stdin, delivering EOF to the process. Returns whether a

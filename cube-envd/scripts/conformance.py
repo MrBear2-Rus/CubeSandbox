@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Conformance snapshot for cube-envd.
+"""Regression snapshot for cube-envd (not an upstream conformance test).
 
 Records a *normalized* snapshot of the deterministic data-plane behavior and
 compares it against a checked-in baseline, so a change in wire shape or
-semantics is caught without needing the upstream Go envd binary.
+semantics is caught without needing the upstream Go envd binary. Passing this
+proves "no regression against the recorded baseline", not "byte-identical to
+upstream envd".
 
     python3 scripts/conformance.py            # compare against the baseline
     python3 scripts/conformance.py --update   # rewrite the baseline

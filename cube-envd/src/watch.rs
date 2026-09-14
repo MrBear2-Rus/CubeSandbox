@@ -28,6 +28,11 @@ use tokio_stream::Stream;
 
 static ACTIVE_WATCHERS: AtomicUsize = AtomicUsize::new(0);
 
+/// Cap on buffered pull-watcher events. A client that never calls
+/// `GetWatcherEvents` must not be able to grow the daemon's memory without
+/// bound; the oldest events are dropped once the cap is reached.
+const MAX_PULL_EVENTS: usize = 10_000;
+
 #[derive(Debug, Deserialize)]
 struct WatchDirRequest {
     path: String,
@@ -248,7 +253,7 @@ fn run_pull_watcher(mut inotify: Inotify, watcher: Arc<PullWatcher>) {
         std::thread::sleep(Duration::from_millis(50));
         match inotify.read_events(&mut buffer) {
             Ok(events) => {
-                let mut collected: Vec<WatchEvent> = events
+                let collected: Vec<WatchEvent> = events
                     .filter_map(|event| {
                         let name = event.name?.to_string_lossy().into_owned();
                         let event_type = event_type(event.mask)?;
@@ -256,16 +261,22 @@ fn run_pull_watcher(mut inotify: Inotify, watcher: Arc<PullWatcher>) {
                     })
                     .collect();
                 if !collected.is_empty() {
-                    watcher
-                        .events
-                        .lock()
-                        .expect("watcher events lock poisoned")
-                        .append(&mut collected);
+                    let mut buffer = watcher.events.lock().expect("watcher events lock poisoned");
+                    push_bounded(&mut buffer, collected);
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
             Err(_) => break,
         }
+    }
+}
+
+/// Append events, keeping at most [`MAX_PULL_EVENTS`] (dropping the oldest).
+fn push_bounded(buffer: &mut Vec<WatchEvent>, mut new_events: Vec<WatchEvent>) {
+    buffer.append(&mut new_events);
+    if buffer.len() > MAX_PULL_EVENTS {
+        let overflow = buffer.len() - MAX_PULL_EVENTS;
+        buffer.drain(0..overflow);
     }
 }
 
@@ -639,5 +650,25 @@ mod tests {
         }))
         .await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn pull_watcher_buffer_is_bounded() {
+        let events = |prefix: &str, count: usize| -> Vec<WatchEvent> {
+            (0..count)
+                .map(|index| WatchEvent {
+                    name: format!("{prefix}{index}"),
+                    event_type: "EVENT_TYPE_CREATE".to_owned(),
+                })
+                .collect()
+        };
+
+        let mut buffer = Vec::new();
+        push_bounded(&mut buffer, events("a", MAX_PULL_EVENTS));
+        assert_eq!(buffer.len(), MAX_PULL_EVENTS);
+
+        push_bounded(&mut buffer, events("b", 5));
+        assert_eq!(buffer.len(), MAX_PULL_EVENTS);
+        assert_eq!(buffer.last().unwrap().name, "b4");
     }
 }

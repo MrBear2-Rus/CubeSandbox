@@ -329,18 +329,14 @@ func parseProcessStartStream(r io.Reader) (*processStartResult, error) {
 			result.Termination = response.Event.End.Termination
 			exitCode, ok := response.Event.End.exitCode()
 			if !ok {
-				if response.Event.End.Termination == nil {
-					if response.Event.End.Error != "" {
-						return nil, fmt.Errorf("process failed: %s", response.Event.End.Error)
-					}
-					return nil, fmt.Errorf("process EndEvent missing exit code")
-				}
-				if response.Event.End.Error != "" && response.Event.End.Termination.Reason != TerminationTimeout {
+				// A missing exit code is always abnormal: a server-side
+				// timeout kill reports exitCode:null plus an error, and the
+				// Python/Node SDKs surface it as an error too. Never report
+				// success for a command that had no exit code.
+				if response.Event.End.Error != "" {
 					return nil, fmt.Errorf("process failed: %s", response.Event.End.Error)
 				}
-				result.ExitCode = 0
-				sawEnd = true
-				continue
+				return nil, fmt.Errorf("process EndEvent missing exit code")
 			}
 			result.ExitCode = exitCode
 			sawEnd = true

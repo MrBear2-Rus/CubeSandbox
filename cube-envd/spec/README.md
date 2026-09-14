@@ -36,6 +36,8 @@
 
 - `GET /health` → 204。
 - `POST /init {envVars,defaultUser,defaultWorkdir,accessToken}` → 204。
+  `/init` 在认证白名单内且会轮换 accessToken，因此沙箱内任何进程都可以重新引导并替换 token
+  （与上游 envd 的引导形态一致）；`X-Access-Token` 仅在 `/init` 提供 token 后才校验。
 - `GET /envs` → `{key: value}`。
 - `GET /metrics` → `{ts,cpu_count,cpu_used_pct,mem_total,mem_used,mem_cache,mem_total_mib,mem_used_mib,disk_used,disk_total}`。
 - `GET/POST /files?path=...` → 原始字节；支持 Range `206`、`416`、条件 `304`。

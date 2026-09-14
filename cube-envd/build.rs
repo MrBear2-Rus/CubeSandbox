@@ -2,6 +2,14 @@ use std::{env, process::Command};
 
 fn main() {
     println!("cargo:rerun-if-env-changed=CUBE_ENVD_COMMIT");
+    // The git fallback below must be re-evaluated when HEAD moves; otherwise
+    // `envd -commit` / GET /status.commit go stale for local builds.
+    if let Some(manifest_dir) = env::var_os("CARGO_MANIFEST_DIR") {
+        let git_head = std::path::Path::new(&manifest_dir).join(".git/HEAD");
+        if git_head.exists() {
+            println!("cargo:rerun-if-changed={}", git_head.display());
+        }
+    }
 
     let commit = env::var("CUBE_ENVD_COMMIT")
         .ok()
