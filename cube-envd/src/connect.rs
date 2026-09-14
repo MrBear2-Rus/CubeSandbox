@@ -196,4 +196,65 @@ mod tests {
         let error = read_from_frame(frame).await.unwrap_err();
         assert!(matches!(error, FrameError::PayloadTooLarge(value) if value == size));
     }
+
+    #[test]
+    fn encode_and_decode_frame_round_trip() {
+        let frame = encode_frame(0, b"payload");
+        let (flags, payload) = decode_frame(&frame).unwrap();
+        assert_eq!(flags, 0);
+        assert_eq!(payload, b"payload");
+    }
+
+    #[test]
+    fn decode_frame_rejects_truncated_header() {
+        let error = decode_frame(&[0, 0, 0]).unwrap_err();
+        assert!(matches!(
+            error,
+            FrameError::Io(ref error) if error.kind() == std::io::ErrorKind::UnexpectedEof
+        ));
+    }
+
+    #[test]
+    fn decode_frame_rejects_size_mismatch() {
+        let mut frame = vec![0u8];
+        frame.extend_from_slice(&5u32.to_be_bytes());
+        frame.extend_from_slice(b"ab");
+        let error = decode_frame(&frame).unwrap_err();
+        assert!(matches!(
+            error,
+            FrameError::Io(ref error) if error.kind() == std::io::ErrorKind::InvalidData
+        ));
+    }
+
+    #[test]
+    fn decode_frame_rejects_compressed_flag() {
+        let mut frame = vec![COMPRESSED_FLAG];
+        frame.extend_from_slice(&0u32.to_be_bytes());
+        assert!(matches!(
+            decode_frame(&frame).unwrap_err(),
+            FrameError::Compressed
+        ));
+    }
+
+    #[test]
+    fn decode_frame_rejects_oversized_payload() {
+        let mut frame = vec![0u8];
+        frame.extend_from_slice(&(MAX_PAYLOAD_SIZE + 1).to_be_bytes());
+        assert!(matches!(
+            decode_frame(&frame).unwrap_err(),
+            FrameError::PayloadTooLarge(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_frame_rejects_truncated_payload() {
+        let mut frame = vec![0u8];
+        frame.extend_from_slice(&4u32.to_be_bytes());
+        frame.extend_from_slice(b"ab");
+        let error = read_from_frame(frame).await.unwrap_err();
+        assert!(matches!(
+            error,
+            FrameError::Io(ref error) if error.kind() == std::io::ErrorKind::UnexpectedEof
+        ));
+    }
 }

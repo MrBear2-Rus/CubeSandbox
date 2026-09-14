@@ -29,6 +29,15 @@ pub(crate) struct FileQuery {
 }
 
 pub async fn get(headers: HeaderMap, Query(query): Query<FileQuery>) -> Response {
+    // cube-envd only serves identity (no gzip). Match upstream's refusal
+    // behavior when the client explicitly says identity is unacceptable.
+    if !identity_acceptable(&headers) {
+        return error_response_with_code(
+            StatusCode::NOT_ACCEPTABLE,
+            "invalid_argument",
+            "identity content encoding is not acceptable".to_owned(),
+        );
+    }
     let path = match fs::canonicalize(&query.path) {
         Ok(path) => path,
         Err(error) => return fs_error_response(error),
@@ -128,6 +137,53 @@ fn parse_http_date(value: &str) -> Option<u64> {
         .and_then(|date| u64::try_from(date.timestamp()).ok())
 }
 
+/// Whether the client's `Accept-Encoding` still accepts an unencoded
+/// (identity) response. Identity is acceptable unless a `q=0` for `identity`,
+/// or for `*` with no explicit `identity` entry, is present.
+fn identity_acceptable(headers: &HeaderMap) -> bool {
+    let Some(value) = headers.get(header::ACCEPT_ENCODING) else {
+        return true;
+    };
+    let Ok(value) = value.to_str() else {
+        return true;
+    };
+
+    let mut identity_quality = None;
+    let mut wildcard_quality = None;
+    for entry in value.split(',') {
+        let mut pieces = entry.split(';');
+        let name = pieces.next().unwrap_or("").trim().to_ascii_lowercase();
+        if name.is_empty() {
+            continue;
+        }
+        let mut quality = 1.0_f32;
+        for parameter in pieces {
+            if let Some(rest) = parameter.trim().strip_prefix("q=") {
+                if let Ok(parsed) = rest.trim().parse::<f32>() {
+                    quality = parsed;
+                }
+            }
+        }
+        match name.as_str() {
+            "identity" => identity_quality = Some(quality),
+            "*" => wildcard_quality = Some(quality),
+            _ => {}
+        }
+    }
+
+    identity_quality.or(wildcard_quality).unwrap_or(1.0) > 0.0
+}
+
+/// `/files/compose` stays in the route table so callers get an explicit 501
+/// instead of a misleading 404.
+pub async fn compose() -> Response {
+    error_response_with_code(
+        StatusCode::NOT_IMPLEMENTED,
+        "unimplemented",
+        "/files/compose is not implemented by cube-envd".to_owned(),
+    )
+}
+
 fn parse_range(
     value: Option<&axum::http::HeaderValue>,
     length: usize,
@@ -137,7 +193,12 @@ fn parse_range(
     };
     let value = value.to_str().map_err(|_| ())?;
     let range = value.strip_prefix("bytes=").ok_or(())?;
-    if range.contains(',') || length == 0 {
+    if range.contains(',') {
+        // Multi-range requests are not implemented; serve the whole file with
+        // 200 (upstream returns 206 multipart/byteranges).
+        return Ok(None);
+    }
+    if length == 0 {
         return Err(());
     }
     let (start, end) = range.split_once('-').ok_or(())?;
@@ -323,12 +384,14 @@ fn lexical_normalize(path: &Path) -> PathBuf {
 }
 
 fn write_file(path: &Path, data: &[u8]) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    // Preserve an existing file's mode on overwrite; new files get 0644.
+    let mode = fs::metadata(path)
+        .ok()
+        .map(|metadata| metadata.permissions().mode() & 0o7777)
+        .unwrap_or(0o644);
     fs::write(path, data)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o644))?;
-    }
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
     Ok(())
 }
 
@@ -420,7 +483,10 @@ fn error_response_with_code(status: StatusCode, code: &str, message: String) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{body::to_bytes, http::Request};
+    use axum::{
+        body::to_bytes,
+        http::{HeaderValue, Request},
+    };
     use tempfile::tempdir;
 
     #[tokio::test]
@@ -592,5 +658,201 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    fn range_header(value: &str) -> axum::http::HeaderValue {
+        axum::http::HeaderValue::from_str(value).unwrap()
+    }
+
+    #[test]
+    fn parse_range_handles_closed_open_and_suffix() {
+        assert_eq!(
+            parse_range(Some(&range_header("bytes=2-4")), 10).unwrap(),
+            Some((2, 4))
+        );
+        assert_eq!(
+            parse_range(Some(&range_header("bytes=5-")), 10).unwrap(),
+            Some((5, 9))
+        );
+        assert_eq!(
+            parse_range(Some(&range_header("bytes=-3")), 10).unwrap(),
+            Some((7, 9))
+        );
+    }
+
+    #[test]
+    fn parse_range_clamps_end_beyond_length() {
+        assert_eq!(
+            parse_range(Some(&range_header("bytes=2-100")), 10).unwrap(),
+            Some((2, 9))
+        );
+    }
+
+    #[test]
+    fn parse_range_rejects_invalid_forms() {
+        for value in ["items=0-1", "bytes=10-", "bytes=5-2", "bytes=-0", "bytes="] {
+            assert!(
+                parse_range(Some(&range_header(value)), 10).is_err(),
+                "{value} should be rejected"
+            );
+        }
+        assert!(parse_range(Some(&range_header("bytes=0-1")), 0).is_err());
+    }
+
+    #[test]
+    fn parse_range_serves_whole_file_for_multi_range() {
+        assert_eq!(
+            parse_range(Some(&range_header("bytes=0-1,3-4")), 10).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_range_returns_none_without_header() {
+        assert_eq!(parse_range(None, 10).unwrap(), None);
+    }
+
+    #[test]
+    fn http_date_round_trips() {
+        let formatted = format_http_date(1_700_000_000);
+        assert_eq!(parse_http_date(&formatted), Some(1_700_000_000));
+        assert_eq!(parse_http_date("not a date"), None);
+    }
+
+    #[tokio::test]
+    async fn post_without_path_returns_bad_request() {
+        let request = Request::builder().body(Body::from("x")).unwrap();
+        assert_eq!(post(request).await.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn multipart_without_file_field_returns_bad_request() {
+        let boundary = "cube-envd-no-file";
+        let body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"not_file\"\r\n\r\nvalue\r\n--{boundary}--\r\n"
+        );
+        let request = Request::builder()
+            .uri("/files?path=/tmp/cube-envd-mp-not-file")
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(body))
+            .unwrap();
+        assert_eq!(post(request).await.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn write_preserves_existing_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("mode.txt");
+        fs::write(&path, b"old").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let request = Request::builder()
+            .uri(format!("/files?path={}", path.display()))
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .body(Body::from("new"))
+            .unwrap();
+        assert_eq!(post(request).await.status(), StatusCode::OK);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new");
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn identity_is_acceptable_by_default() {
+        assert!(identity_acceptable(&HeaderMap::new()));
+        for value in [
+            "gzip",
+            "gzip, deflate, br",
+            "identity;q=0.5",
+            "*;q=0.5",
+            "gzip;q=0",
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::ACCEPT_ENCODING,
+                HeaderValue::from_str(value).unwrap(),
+            );
+            assert!(
+                identity_acceptable(&headers),
+                "expected acceptable: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_is_refused_when_explicitly_unacceptable() {
+        for value in ["identity;q=0", "*;q=0", "gzip, *;q=0"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::ACCEPT_ENCODING,
+                HeaderValue::from_str(value).unwrap(),
+            );
+            assert!(!identity_acceptable(&headers), "expected refused: {value}");
+        }
+    }
+
+    #[tokio::test]
+    async fn get_refuses_unacceptable_identity_with_406() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("identity.txt");
+        fs::write(&path, b"content").unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::ACCEPT_ENCODING,
+            HeaderValue::from_static("identity;q=0"),
+        );
+        let response = get(
+            headers,
+            Query(FileQuery {
+                path: path.to_string_lossy().into_owned(),
+                username: None,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_ACCEPTABLE);
+    }
+
+    #[tokio::test]
+    async fn files_compose_is_explicitly_unimplemented() {
+        let response = compose().await;
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        let body = to_bytes(response.into_body(), MAX_FILE_BODY_SIZE)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["code"],
+            "unimplemented"
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_range_request_serves_the_whole_file() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("multi-range.txt");
+        fs::write(&path, b"0123456789").unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::RANGE, HeaderValue::from_static("bytes=0-1,3-4"));
+        let response = get(
+            headers,
+            Query(FileQuery {
+                path: path.to_string_lossy().into_owned(),
+                username: None,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(response.into_body(), MAX_FILE_BODY_SIZE)
+                .await
+                .unwrap(),
+            "0123456789"
+        );
     }
 }

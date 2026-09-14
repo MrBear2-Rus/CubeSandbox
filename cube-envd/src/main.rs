@@ -22,17 +22,37 @@ use tokio::net::TcpListener;
 use tracing::{info, warn};
 use tracing_subscriber::filter::LevelFilter;
 
+mod auth;
 pub mod connect;
 mod cors;
+mod defaults;
 mod files;
 mod filesystem;
+mod init;
+mod metrics;
 mod process;
+mod processes;
 mod pty;
 mod termination;
 mod watch;
 
 const REQUEST_ID_HEADER: &str = "x-request-id";
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+/// The upstream envd generation cube-envd is protocol-compatible with.
+///
+/// Clients gate features on the version a sandbox reports (recursive watch,
+/// command stdin, default user, closeStdin, octet-stream upload, file
+/// metadata, watch `includeEntry`, network mounts), and Cubelet records the
+/// `envd --version` output as the template's `envdVersion`. Reporting the
+/// crate version (`0.1.0`) made every gate answer "too old", so this constant
+/// reports the emulated generation instead; the real implementation version is
+/// `env!("CARGO_PKG_VERSION")` and the build's short sha comes from `-commit`.
+const ENVD_GENERATION: &str = "0.5.13";
+
+fn version_line() -> String {
+    format!("cube-envd {ENVD_GENERATION}")
+}
 
 async fn process_start_dispatch(headers: HeaderMap, body: Bytes) -> Response {
     let is_pty = connect::decode_frame(&body)
@@ -93,6 +113,48 @@ fn normalized_args(args: impl IntoIterator<Item = String>) -> Vec<String> {
         .collect()
 }
 
+/// Drops unknown flags (with a warning) so `ENVD_EXTRA_ARGS` written for the
+/// upstream Go envd does not make cube-envd refuse to start.
+fn filtered_args(args: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut filtered = Vec::new();
+    let mut iter = args.into_iter().peekable();
+    while let Some(arg) = iter.next() {
+        if filtered.is_empty() {
+            filtered.push(arg);
+            continue;
+        }
+        let known = matches!(
+            arg.as_str(),
+            "--port" | "--isnotfc" | "--version" | "--commit"
+        ) || arg.starts_with("--port=");
+        if known {
+            let is_port_with_value = arg == "--port";
+            filtered.push(arg);
+            if is_port_with_value {
+                if let Some(value) = iter.peek() {
+                    if !value.starts_with('-') {
+                        filtered.push(iter.next().expect("peeked value exists"));
+                    }
+                }
+            }
+            continue;
+        }
+        eprintln!("cube-envd: ignoring unknown argument {arg}");
+        if !arg.starts_with('-') {
+            continue;
+        }
+        if !arg.contains('=') {
+            if let Some(value) = iter.peek() {
+                if !value.starts_with('-') {
+                    let value = iter.next().expect("peeked value exists");
+                    eprintln!("cube-envd: ignoring unknown argument {value}");
+                }
+            }
+        }
+    }
+    filtered
+}
+
 async fn health() -> StatusCode {
     StatusCode::NO_CONTENT
 }
@@ -101,11 +163,52 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<StatusResponse> {
     Json(StatusResponse {
         service: "cube-envd",
         ready: true,
-        version: env!("CARGO_PKG_VERSION"),
+        version: ENVD_GENERATION,
         commit: env!("GIT_SHORT_SHA"),
         port: state.port,
         uptime_seconds: state.started_at.elapsed().as_secs(),
     })
+}
+
+async fn codec_guard(request: Request<axum::body::Body>, next: Next) -> Response {
+    let path = request.uri().path();
+    if (path.contains(".Process/") || path.contains(".Filesystem/"))
+        && protobuf_codec_requested(request.headers())
+    {
+        let payload = serde_json::json!({
+            "code": "unimplemented",
+            "message": "cube-envd only implements the Connect JSON codec; send Content-Type application/json",
+        });
+        return Response::builder()
+            .status(StatusCode::NOT_IMPLEMENTED)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(payload.to_string()))
+            .expect("valid codec error response");
+    }
+    next.run(request).await
+}
+
+/// True when the request asks for the Connect binary-protobuf codec, which
+/// cube-envd rejects up front (every known client uses the JSON codec).
+fn protobuf_codec_requested(headers: &HeaderMap) -> bool {
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            value
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase()
+        });
+    matches!(
+        content_type.as_deref(),
+        Some("application/proto")
+            | Some("application/connect+proto")
+            | Some("application/grpc")
+            | Some("application/grpc+proto")
+    )
 }
 
 async fn request_log(request: Request<axum::body::Body>, next: Next) -> Response {
@@ -203,10 +306,10 @@ fn configured_log_format(value: Option<&str>) -> LogFormat {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let cli = Cli::parse_from(normalized_args(env::args()));
+    let cli = Cli::parse_from(filtered_args(normalized_args(env::args())));
 
     if cli.show_version {
-        println!("cube-envd {}", env!("CARGO_PKG_VERSION"));
+        println!("{}", version_line());
         return Ok(());
     }
 
@@ -229,7 +332,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!(
         %address,
         service = "cube-envd",
-        version = env!("CARGO_PKG_VERSION"),
+        generation = ENVD_GENERATION,
+        implementation_version = env!("CARGO_PKG_VERSION"),
         commit = env!("GIT_SHORT_SHA"),
         "cube-envd listening"
     );
@@ -237,10 +341,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = Router::new()
         .route("/health", get(health))
         .route("/status", get(status))
+        .route("/init", axum::routing::post(init::init))
+        .route("/envs", get(init::envs))
+        .route("/metrics", get(metrics::metrics))
         .route(
             "/process.Process/Start",
             axum::routing::post(process_start_dispatch),
         )
+        .route("/process.Process/List", axum::routing::post(process::list))
         .route(
             "/process.Process/Connect",
             axum::routing::post(pty::connect),
@@ -253,8 +361,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/process.Process/SendInput",
             axum::routing::post(pty::send_input),
         )
+        .route(
+            "/process.Process/StreamInput",
+            axum::routing::post(process::stream_input),
+        )
+        .route(
+            "/process.Process/CloseStdin",
+            axum::routing::post(process::close_stdin),
+        )
         .route("/process.Process/Update", axum::routing::post(pty::update))
         .route("/files", get(files::get).post(files::post))
+        .route("/files/compose", axum::routing::post(files::compose))
         .route(
             "/filesystem.Filesystem/ListDir",
             axum::routing::post(filesystem::list_dir),
@@ -279,7 +396,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/filesystem.Filesystem/WatchDir",
             axum::routing::post(watch::watch_dir),
         )
+        .route(
+            "/filesystem.Filesystem/CreateWatcher",
+            axum::routing::post(watch::create_watcher),
+        )
+        .route(
+            "/filesystem.Filesystem/GetWatcherEvents",
+            axum::routing::post(watch::get_watcher_events),
+        )
+        .route(
+            "/filesystem.Filesystem/RemoveWatcher",
+            axum::routing::post(watch::remove_watcher),
+        )
         .with_state(state)
+        .layer(axum::middleware::from_fn(auth::layer))
+        .layer(axum::middleware::from_fn(codec_guard))
         .layer(axum::middleware::from_fn(request_log))
         .layer(axum::middleware::from_fn(cors::layer));
     axum::serve(listener, app).await?;
@@ -290,8 +421,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        configured_log_format, configured_log_level, normalized_args, request_id, AppState,
-        LogFormat, StatusResponse, REQUEST_ID_HEADER,
+        configured_log_format, configured_log_level, filtered_args, normalized_args,
+        protobuf_codec_requested, request_id, version_line, AppState, LogFormat, StatusResponse,
+        ENVD_GENERATION, REQUEST_ID_HEADER,
     };
     use axum::http::{HeaderMap, HeaderValue};
     use std::{sync::Arc, time::Instant};
@@ -332,7 +464,7 @@ mod tests {
         let response = StatusResponse {
             service: "cube-envd",
             ready: true,
-            version: env!("CARGO_PKG_VERSION"),
+            version: ENVD_GENERATION,
             commit: env!("GIT_SHORT_SHA"),
             port: state.port,
             uptime_seconds: state.started_at.elapsed().as_secs(),
@@ -341,7 +473,7 @@ mod tests {
 
         assert_eq!(value["service"], "cube-envd");
         assert_eq!(value["ready"], true);
-        assert!(value["version"].is_string());
+        assert_eq!(value["version"], ENVD_GENERATION);
         assert!(value["commit"].is_string());
         assert_eq!(value["port"], 49983);
         assert!(value["uptimeSeconds"].is_u64());
@@ -388,5 +520,105 @@ mod tests {
 
         let generated = request_id(&HeaderMap::new());
         assert!(generated.starts_with("cube-envd-"));
+    }
+
+    #[test]
+    fn request_id_rejects_overlong_value() {
+        let mut headers = HeaderMap::new();
+        let long = "a".repeat(129);
+        headers.insert(REQUEST_ID_HEADER, HeaderValue::from_str(&long).unwrap());
+        let id = request_id(&headers);
+        assert!(id.starts_with("cube-envd-"));
+        assert_ne!(id, long);
+    }
+
+    #[test]
+    fn version_line_reports_the_emulated_generation() {
+        let line = version_line();
+        assert_eq!(line, format!("cube-envd {ENVD_GENERATION}"));
+        // Keeps the `cube-envd ` prefix the base-image smoke test asserts.
+        assert!(line.starts_with("cube-envd "));
+        // Contains a semver so Cubelet's `envd --version` probe extracts it.
+        assert!(
+            line.split_whitespace().any(|token| {
+                token.split('.').count() == 3
+                    && token.split('.').all(|part| {
+                        !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())
+                    })
+            }),
+            "expected a semver in {line:?}"
+        );
+    }
+
+    #[test]
+    fn legacy_port_equals_form_is_normalized() {
+        let args = normalized_args(["-port=1234"].into_iter().map(str::to_owned));
+        assert_eq!(args, vec!["--port=1234"]);
+    }
+
+    #[test]
+    fn unknown_flags_are_dropped_with_their_values() {
+        let args = filtered_args(
+            [
+                "cube-envd",
+                "--port",
+                "39999",
+                "--isnotfc",
+                "--unknown",
+                "value",
+                "--other=1",
+                "stray",
+                "--version",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        );
+        assert_eq!(
+            args,
+            vec!["cube-envd", "--port", "39999", "--isnotfc", "--version"]
+        );
+    }
+
+    #[test]
+    fn protobuf_codec_is_detected_case_insensitively() {
+        for value in [
+            "application/proto",
+            "application/connect+proto",
+            "application/grpc",
+            "application/grpc+proto",
+            "application/proto; charset=utf-8",
+            "Application/Proto",
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                axum::http::header::CONTENT_TYPE,
+                HeaderValue::from_str(value).unwrap(),
+            );
+            assert!(
+                protobuf_codec_requested(&headers),
+                "expected proto: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn json_and_missing_content_types_are_not_protobuf() {
+        for value in [
+            None,
+            Some("application/json"),
+            Some("application/connect+json"),
+        ] {
+            let mut headers = HeaderMap::new();
+            if let Some(value) = value {
+                headers.insert(
+                    axum::http::header::CONTENT_TYPE,
+                    HeaderValue::from_str(value).unwrap(),
+                );
+            }
+            assert!(
+                !protobuf_codec_requested(&headers),
+                "unexpected proto: {value:?}"
+            );
+        }
     }
 }

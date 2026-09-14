@@ -4,16 +4,22 @@ use crate::{
 };
 use axum::{
     body::{Body, Bytes},
+    extract::Json,
     http::{header, HeaderMap, StatusCode},
     response::Response,
 };
 use inotify::{EventMask, Inotify, WatchDescriptor, WatchMask};
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashMap,
     io,
     os::fd::AsRawFd,
+    path::{Path, PathBuf},
     pin::Pin,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        Arc, Mutex, OnceLock,
+    },
     task::{Context, Poll},
     time::Duration,
 };
@@ -115,6 +121,200 @@ pub async fn watch_dir(headers: HeaderMap, body: Bytes) -> Response {
             cancel: Some(cancel_sender),
         }))
         .expect("valid WatchDir stream response")
+}
+
+static WATCHERS: OnceLock<Mutex<HashMap<String, Arc<PullWatcher>>>> = OnceLock::new();
+static WATCHER_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+fn watchers() -> &'static Mutex<HashMap<String, Arc<PullWatcher>>> {
+    WATCHERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+struct PullWatcher {
+    events: Mutex<Vec<WatchEvent>>,
+    stop: AtomicBool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CreateWatcherRequest {
+    path: String,
+    #[serde(default)]
+    recursive: bool,
+    #[serde(default)]
+    include_entry: bool,
+    #[serde(default)]
+    allow_network_mounts: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CreateWatcherResponse {
+    watcher_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct GetWatcherEventsRequest {
+    watcher_id: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct GetWatcherEventsResponse {
+    events: Vec<WatchEvent>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RemoveWatcherRequest {
+    watcher_id: String,
+}
+
+/// Non-streaming watcher: buffers inotify events so a caller can pull them.
+pub async fn create_watcher(
+    headers: HeaderMap,
+    Json(request): Json<CreateWatcherRequest>,
+) -> Response {
+    let username = match filesystem::request_user(&headers) {
+        Ok(username) => username,
+        Err(error) => return filesystem::fs_error_response(error),
+    };
+    let path = match filesystem::existing_path(&request.path) {
+        Ok(path) => path,
+        Err(error) => return filesystem::fs_error_response(error),
+    };
+    if let Err(error) = filesystem::validate_directory(&path, &username) {
+        return filesystem::fs_error_response(error);
+    }
+    let inotify = match Inotify::init() {
+        Ok(inotify) => inotify,
+        Err(error) => {
+            return filesystem_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+        }
+    };
+    if let Err(error) = set_nonblocking(&inotify) {
+        return filesystem_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string());
+    }
+    if let Err(error) = add_watches(&inotify, &path, request.recursive) {
+        return filesystem_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string());
+    }
+    let watcher_id = format!(
+        "w-{}-{}",
+        std::process::id(),
+        WATCHER_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    );
+    let watcher = Arc::new(PullWatcher {
+        events: Mutex::new(Vec::new()),
+        stop: AtomicBool::new(false),
+    });
+    watchers()
+        .lock()
+        .expect("watcher registry lock poisoned")
+        .insert(watcher_id.clone(), Arc::clone(&watcher));
+    let _ = (request.include_entry, request.allow_network_mounts);
+    tokio::task::spawn_blocking(move || run_pull_watcher(inotify, watcher));
+    json_response(StatusCode::OK, CreateWatcherResponse { watcher_id })
+}
+
+pub async fn get_watcher_events(Json(request): Json<GetWatcherEventsRequest>) -> Response {
+    let watcher = match watchers()
+        .lock()
+        .expect("watcher registry lock poisoned")
+        .get(&request.watcher_id)
+        .cloned()
+    {
+        Some(watcher) => watcher,
+        None => return watcher_not_found(),
+    };
+    let events = std::mem::take(&mut *watcher.events.lock().expect("watcher events lock poisoned"));
+    json_response(StatusCode::OK, GetWatcherEventsResponse { events })
+}
+
+pub async fn remove_watcher(Json(request): Json<RemoveWatcherRequest>) -> Response {
+    if let Some(watcher) = watchers()
+        .lock()
+        .expect("watcher registry lock poisoned")
+        .remove(&request.watcher_id)
+    {
+        watcher.stop.store(true, Ordering::Release);
+    }
+    json_response(StatusCode::OK, serde_json::json!({}))
+}
+
+fn run_pull_watcher(mut inotify: Inotify, watcher: Arc<PullWatcher>) {
+    let mut buffer = vec![0u8; 16 * 1024];
+    while !watcher.stop.load(Ordering::Acquire) {
+        std::thread::sleep(Duration::from_millis(50));
+        match inotify.read_events(&mut buffer) {
+            Ok(events) => {
+                let mut collected: Vec<WatchEvent> = events
+                    .filter_map(|event| {
+                        let name = event.name?.to_string_lossy().into_owned();
+                        let event_type = event_type(event.mask)?;
+                        Some(WatchEvent { name, event_type })
+                    })
+                    .collect();
+                if !collected.is_empty() {
+                    watcher
+                        .events
+                        .lock()
+                        .expect("watcher events lock poisoned")
+                        .append(&mut collected);
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(_) => break,
+        }
+    }
+}
+
+fn add_watches(inotify: &Inotify, path: &Path, recursive: bool) -> io::Result<()> {
+    let mask = WatchMask::CREATE
+        | WatchMask::DELETE
+        | WatchMask::MODIFY
+        | WatchMask::ATTRIB
+        | WatchMask::MOVED_FROM
+        | WatchMask::MOVED_TO;
+    inotify
+        .watches()
+        .add(path, mask)
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    if recursive {
+        let mut budget = 1024usize;
+        let mut stack: Vec<PathBuf> = vec![path.to_path_buf()];
+        while let Some(directory) = stack.pop() {
+            if budget == 0 {
+                break;
+            }
+            if let Ok(entries) = std::fs::read_dir(&directory) {
+                for entry in entries.flatten() {
+                    if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+                        let child = entry.path();
+                        if inotify.watches().add(&child, mask).is_ok() {
+                            budget -= 1;
+                        }
+                        stack.push(child);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn watcher_not_found() -> Response {
+    filesystem::fs_error_response(io::Error::new(io::ErrorKind::NotFound, "watcher not found"))
+}
+
+fn json_response<T: Serialize>(status: StatusCode, value: T) -> Response {
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&value).expect("watch response serializes"),
+        ))
+        .expect("valid watch response")
 }
 
 async fn run_watcher(
@@ -363,5 +563,81 @@ mod tests {
         })
         .await
         .expect("WatchDir watcher was not released");
+    }
+
+    #[test]
+    fn unknown_event_mask_has_no_type() {
+        assert!(event_type(EventMask::empty()).is_none());
+    }
+
+    #[tokio::test]
+    async fn watch_dir_missing_path_returns_not_found() {
+        let payload = encode_stream_message(
+            serde_json::json!({"path": "/tmp/cube-envd-no-such-dir"})
+                .to_string()
+                .as_bytes(),
+        );
+        let response = watch_dir(HeaderMap::new(), Bytes::from(payload)).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pull_watcher_reports_events_and_can_be_removed() {
+        use axum::body::to_bytes;
+        use std::fs;
+        use tempfile::tempdir;
+
+        let directory = tempdir().unwrap();
+        let response = create_watcher(
+            HeaderMap::new(),
+            Json(CreateWatcherRequest {
+                path: directory.path().to_string_lossy().into_owned(),
+                recursive: false,
+                include_entry: false,
+                allow_network_mounts: false,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let watcher_id = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["watcherId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        fs::write(directory.path().join("created.txt"), b"x").unwrap();
+
+        let mut saw = false;
+        for _ in 0..40 {
+            let response = get_watcher_events(Json(GetWatcherEventsRequest {
+                watcher_id: watcher_id.clone(),
+            }))
+            .await;
+            let status = response.status();
+            let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+            let events = serde_json::from_slice::<serde_json::Value>(&body).unwrap();
+            if status == StatusCode::OK
+                && events["events"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|event| event["name"] == "created.txt")
+            {
+                saw = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(saw, "pull watcher did not report the created file");
+
+        let response = remove_watcher(Json(RemoveWatcherRequest { watcher_id })).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = get_watcher_events(Json(GetWatcherEventsRequest {
+            watcher_id: "w-missing".to_owned(),
+        }))
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }

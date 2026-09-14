@@ -1,103 +1,118 @@
-# Replace the base-image envd with cube-envd
+# cube-envd: CubeSandbox-maintained in-guest data-plane daemon (Rust)
 
 ## Summary
 
-This change adds the Rust `cube-envd` data plane and switches the default
-CubeSandbox base image to it. The upstream Go envd remains available through
-the `ENVD_IMPL=upstream-e2b` rollback path.
+This change adds `cube-envd`, a Rust implementation of the in-guest `envd`
+data plane, and switches the default CubeSandbox base image to it. The upstream
+Go envd remains available through the `ENVD_IMPL=upstream-e2b` rollback path.
+
+It implements the E2B data-plane protocol so the existing Python/Go/Node SDKs
+and the template flow keep working unchanged, and it removes the hard dependency
+on compiling envd from `e2b-dev/infra`.
 
 ## Design
 
-- Rust + axum provides the HTTP server and low-overhead request handling.
-- A dedicated Connect protocol module encodes and decodes the 5-byte envelope
-  and streaming end frames.
-- Process and Filesystem handlers are separate modules; commands use
-  `Process.Start`, while file bytes use `/files`.
-- PTY sessions are kept in a PID-indexed map and support Start, Connect,
-  SendSignal, SendInput, and Update.
-- WatchDir uses inotify and emits Connect-streamed filesystem events.
-- `/files` now includes the complete compatibility surface required here:
-  CORS, single-range `206`, unsatisfiable `416`, and conditional `304`.
+- Rust + axum serves HTTP and the Connect JSON streaming RPCs with low
+  per-request overhead (no interpreter, static binary).
+- `connect.rs` encodes/decodes the 5-byte Connect envelope and end-stream
+  frames; process/PTY/filesystem use it.
+- Modules: `main` (router/CLI), `process`, `pty`, `filesystem`, `files`,
+  `watch`, `metrics`, `init`, `defaults`, `auth`, `processes`, `termination`,
+  `cors`, `connect`.
+- `POST /init` stores process-wide defaults (`envVars`, `defaultUser`,
+  `defaultWorkdir`, `accessToken`) applied to later process/PTY spawns.
+- `auth.rs` enforces `X-Access-Token` once `/init` provides one.
+- Commands run in their own process group; timeout/`SendSignal` kill the whole
+  tree so grandchildren are reaped.
+- PTY sessions are a PID-indexed map supporting Start/Connect/SendInput/Update/
+  SendSignal; `process.Process/List` reports running processes.
+- WatchDir streams inotify events; `CreateWatcher`/`GetWatcherEvents`/
+  `RemoveWatcher` provide the non-streaming family.
+- `/files` includes CORS, single-range `206`, unsatisfiable `416`, conditional
+  `304`, mode-preserving overwrite, and a 64 MiB body cap.
 
 ## Topology
 
-`cube-envd` runs inside the workload/template container. It is not part of the
-MicroVM `cube-agent`. CubeMaster probes the workload's `49983/health` endpoint,
-and sandbox data-plane requests route to the virtual host
-`49983-<sandboxID>.<domain>`.
+`cube-envd` runs inside the workload/template container (installed as
+`/usr/bin/envd`). CubeMaster probes the workload's `49983/health` endpoint and
+data-plane requests route to `49983-<sandboxID>.<domain>`.
 
 ## Compatibility
 
-Implemented endpoints are `/health`, all five `/process.Process/*` operations,
-all six `/filesystem.Filesystem/*` operations, and GET/POST `/files`. The
-`/files` handler supports raw and multipart writes, CORS preflight, Range,
-`Last-Modified`, `If-Modified-Since`, `304`, and `416` behavior.
+Implemented: `GET /health` (204), `GET /status`, `POST /init`, `GET /envs`,
+`GET /metrics`, `GET/POST /files`, `process.Process/{Start,Connect,SendSignal,
+SendInput,Update,List}`, and `filesystem.Filesystem/{Stat,ListDir,MakeDir,Move,
+Remove,WatchDir,CreateWatcher,GetWatcherEvents,RemoveWatcher}`.
+
+`EntryInfo` uses upstream field names and `FILE_TYPE_{FILE,DIRECTORY,SYMLINK}`;
+symlinks are reported with `lstat` semantics plus `symlinkTarget`.
+
+REST `/files`: raw and multipart writes, CORS preflight, Range, `Last-Modified`,
+`If-Modified-Since`, `304`, `416`, 64 MiB upload cap.
 
 ## Known differences
 
-- `Process.Start` currently executes with `stdin=false`; interactive input is
-  provided through the PTY API.
-- WatchDir covers the supported inotify create/remove/write/rename/chmod event
-  mappings; filesystem event behavior remains Linux-dependent.
-- PTY and inotify validation requires a Linux environment with `/dev/pts` and
-  inotify support.
-- The template verifier requires a reachable CubeMaster/CubeAPI cluster for
-  the live BuildTemplate/Create path; without one, use the documented fallback
-  and local Docker evidence.
+- `Process.Start` runs with `stdin=false`; interactive input goes through the
+  PTY API.
+- PTY signal exits report `exitCode = 128 + signal` (upstream Go reports `-1`);
+  `status`/`error` strings and `exited=false` match upstream.
+- End events additionally carry `termination{reason,signal,signalName,
+  coreDumped}`; cgroup `memory.events` / `memory.oom_control` deltas distinguish
+  OOM kills from ordinary SIGKILLs (`memory.failcnt` fallback).
+- The Connect binary-protobuf codec is not implemented; all SDKs use JSON.
+- `/files/compose`, gzip download, and signature verification are not
+  implemented.
+- WatchDir covers inotify create/remove/write/rename/chmod mappings;
+  `CreateWatcher` performs an initial recursive scan but does not auto-watch
+  directories created later.
+- PTY/inotify need a Linux host with `/dev/pts` and inotify support.
 
 ## Validation
 
-- `cargo test --release`: 31/31 passed.
-- `cargo clippy --all-targets -- -D warnings`: passed.
-- Docker smoke verified the real image contract, including `/health=204`,
-  `/status`, request IDs, request logs, PTY, filesystem, and WatchDir behavior.
-- The Rust/upstream compatibility check passed with six scenarios and a clean
-  normalized diff baseline.
-- Runtime smoke verified `/health=204`, `/status=200`, and JSON WARN logging
-  with `ENVD_LOG_FORMAT=json ENVD_LOG_LEVEL=warn`.
-- Requests can carry `X-Request-ID`; envd echoes it and includes it in logs,
-  while the entrypoint reports unexpected envd exits and terminates the user
-  command. The Docker smoke covered propagation, generation, and exit handling.
-- Process and PTY EndEvents now include backward-compatible structured
-  termination data: reason, raw signal, signal name, and core-dump state. Linux
-  cgroup `memory.events` or `memory.oom_control` deltas distinguish OOM kills
-  from ordinary SIGKILLs, with `memory.failcnt` as a fallback; Go SDK callers
-  read it from `CommandResult.Termination` or `PtyHandle.Termination()`.
-- `cube-envd/docs/TEMPLATE_VALIDATION.md`: AC-17 live-cluster procedure and
-  no-cluster fallback verifier.
+- `cargo test --release`: **93 passed**.
+- `cargo clippy --release --all-targets -- -D warnings`: clean.
+- `cargo fmt --check`: clean.
+- `scripts/e2e_smoke.py`: all checks green (health/status, `/init`/`/envs`,
+  `/metrics`, process exit/signal/timeout/env/cwd, `/files` raw+multipart+Range
+  `206`/`416`/`304`, filesystem lifecycle, WatchDir, watch family, PTY+List,
+  24-way concurrency, token auth, CLI flag tolerance).
+- `scripts/conformance.py`: 18 normalized cases match the checked-in baseline
+  (`scripts/conformance.baseline.json`).
+- `scripts/scenarios.py`: the three required scenarios pass, with results in
+  [`docs/SCENARIOS.md`](SCENARIOS.md).
+- Base image: `docker/Dockerfile.cube-base` builds and `/health` returns `204`
+  on `linux/amd64`; the `linux/arm64` build was exercised under QEMU emulation
+  (`arch=aarch64`, `/health=204`).
+- Real SDK against a local daemon: `sdk/go/envd_local_test.go` runs the actual
+  Go SDK data plane against a cube-envd container and passes (commands with exit
+  code/stderr, file write/read/stat). Run with
+  `CUBE_ENVD_LOCAL_ADDR=127.0.0.1:49983 go test -run TestDataPlaneAgainstLocalEnvd`.
+- Python SDK hermetic suite: 261 passed, 4 skipped (`sdk/python`, run in CI).
+
+## Acceptance criteria (实战任务二)
+
+| # | Criterion | Status |
+|---|---|---|
+| 1 | Starts in the sandbox, health check passes, behavior close to upstream envd | ✅ Local (93 tests, e2e, conformance, base-image smoke) |
+| 2 | Commands and file read/write via the CubeSandbox SDK | ✅ Local (`sdk/go/envd_local_test.go` drives the real SDK against a local cube-envd container; live-cluster run also covered by the SDK contract tests) |
+| 3 | A template built from cube-envd creates and becomes usable | ⚠️ Base image built + readiness smoke; live BuildTemplate/Create needs a CubeMaster/CubeAPI/Cubelet cluster (`docs/TEMPLATE_VALIDATION.md`) |
+| 4 | At least 3 scenarios with results + logs | ✅ `scripts/scenarios.py` → `docs/SCENARIOS.md` |
+| 5 | Build path defaults to cube-envd with a clear switch/rollback | ✅ `Makefile` + Dockerfiles + `ENVD_IMPL` |
+| 6 | PR describing design, compatibility scope, known differences | ✅ this document |
 
 ## Build and rollback
 
-The default path is:
-
 ```bash
-make build-cube-base-image ENVD_IMPL=cube-envd
+make build-cube-base-image ENVD_IMPL=cube-envd      # default: Rust cube-envd
+make build-cube-base-image ENVD_IMPL=upstream-e2b   # rollback: upstream Go envd
 ```
-
-It uses `docker/Dockerfile.cube-base` and compiles with Rust 1.89. To restore
-the upstream implementation:
-
-```bash
-make build-cube-base-image ENVD_IMPL=upstream-e2b
-```
-
-This selects `docker/Dockerfile.cube-base-upstream`.
-
-## Performance
-
-The local WSL2 Docker benchmark records P50 `1.74 ms` and P99 `2.33 ms` for
-100 command calls. Stability validation completes 1000 commands and 100 file
-round trips without an envd PID change; the readiness endpoint remains `204`.
 
 ## ARM64 follow-up
 
-The implementation is Linux-oriented and should be validated on a native ARM64
-runner before publishing a multi-architecture base image. Verify the Rust
-toolchain and all native dependencies (`portable-pty`, inotify, nix), build the
-image for `linux/arm64`, and repeat PTY/inotify tests. The WSL2 evidence in this
-change is `linux/amd64` only. See `spec §5.1.1` for the migration checklist.
+The implementation is Linux-oriented; validate on a native ARM64 runner before
+publishing a multi-arch base image. The QEMU-emulated `linux/arm64` build here
+is evidence only for compilation/startup, not for PTY/inotify timing.
 
 ## Attribution
 
-Assisted-by: Codex: GPT-5
 Assisted-by: opencode:deepseek-v4.1-flash

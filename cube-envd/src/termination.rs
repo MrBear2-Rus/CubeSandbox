@@ -305,4 +305,20 @@ mod tests {
             Some(path)
         );
     }
+
+    #[test]
+    fn signal_names_cover_known_and_unknown() {
+        assert_eq!(signal_name(9), "SIGKILL");
+        assert_eq!(signal_name(11), "SIGSEGV");
+        assert_eq!(signal_name(64), "SIG64");
+        assert_eq!(legacy_signal_name(9), "killed");
+        assert_eq!(legacy_signal_name(64), "signal 64");
+    }
+
+    #[test]
+    fn termination_reason_serializes_snake_case() {
+        let value = serde_json::to_value(TerminationInfo::timeout()).unwrap();
+        assert_eq!(value["reason"], "timeout");
+        assert!(value.get("signal").is_none());
+    }
 }

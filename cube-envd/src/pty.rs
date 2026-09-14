@@ -1,5 +1,7 @@
 use crate::connect::{decode_frame, encode_end_stream, encode_stream_message};
+use crate::defaults::{self, Defaults};
 use crate::process::connect_timeout;
+use crate::processes::{self, ProcessRecord};
 use crate::termination::{self, CgroupMemoryMonitor, TerminationInfo};
 use axum::{
     body::Body,
@@ -55,6 +57,8 @@ enum PtyEvent {
 struct PtyStartRequest {
     process: PtyProcessConfig,
     pty: PtyConfig,
+    #[serde(default)]
+    tag: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -103,7 +107,10 @@ struct PtyInputRequest {
 
 #[derive(Debug, Deserialize)]
 struct PtyInput {
-    pty: String,
+    #[serde(default)]
+    stdin: Option<String>,
+    #[serde(default)]
+    pty: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -155,7 +162,15 @@ pub async fn start(headers: HeaderMap, body: bytes::Bytes) -> Response {
         Err(error) => return error_response(StatusCode::BAD_REQUEST, error),
     };
     let size = pty_size(request.pty.size);
-    let command = match build_command(request.process) {
+    let defaults = defaults::snapshot();
+    let record = ProcessRecord {
+        cmd: request.process.cmd.clone(),
+        args: request.process.args.clone(),
+        envs: defaults.merged_env_vars(&request.process.envs),
+        cwd: request.process.cwd.clone().or_else(|| defaults.workdir()),
+        tag: request.tag.clone(),
+    };
+    let command = match build_command(request.process, &defaults) {
         Ok(command) => command,
         Err(error) => return error_response(StatusCode::BAD_REQUEST, error.to_string()),
     };
@@ -163,7 +178,7 @@ pub async fn start(headers: HeaderMap, body: bytes::Bytes) -> Response {
         Ok(timeout) => timeout,
         Err(error) => return error_response(StatusCode::BAD_REQUEST, error),
     };
-    let session = match create_session(command, size, timeout) {
+    let session = match create_session(command, size, timeout, record) {
         Ok(session) => session,
         Err(error) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
     };
@@ -203,7 +218,7 @@ pub async fn send_signal(body: bytes::Bytes) -> Response {
             sys::signal::{kill, Signal},
             unistd::Pid,
         };
-        if let Err(error) = kill(Pid::from_raw(session.pid as i32), Signal::SIGKILL) {
+        if let Err(error) = kill(Pid::from_raw(-(session.pid as i32)), Signal::SIGKILL) {
             return error_response(StatusCode::INTERNAL_SERVER_ERROR, error.to_string());
         }
     }
@@ -223,27 +238,51 @@ pub async fn send_input(body: bytes::Bytes) -> Response {
         Ok(request) => request,
         Err(error) => return error_response(StatusCode::BAD_REQUEST, error.to_string()),
     };
-    let input = match STANDARD.decode(request.input.pty) {
+    let stdin_arm = request.input.stdin.as_deref();
+    let pty_arm = request.input.pty.as_deref();
+    if stdin_arm.is_some() as u8 + pty_arm.is_some() as u8 != 1 {
+        return error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "SendInput input must set exactly one arm".to_owned(),
+        );
+    }
+    let encoded = stdin_arm.or(pty_arm).expect("exactly one arm is set");
+    let input = match STANDARD.decode(encoded) {
         Ok(input) => input,
         Err(error) => return error_response(StatusCode::BAD_REQUEST, error.to_string()),
     };
-    let session = match find_session(request.process.pid) {
-        Some(session) => session,
-        None => return not_found_response(),
+    if stdin_arm.is_some() {
+        return match crate::processes::write_stdin(request.process.pid, &input).await {
+            Ok(true) => empty_response(),
+            Ok(false) => error_response(
+                StatusCode::NOT_IMPLEMENTED,
+                format!("no stdin for process {}", request.process.pid),
+            ),
+            Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+        };
+    }
+    match write_pty_input(request.process.pid, &input) {
+        Ok(true) => empty_response(),
+        Ok(false) => not_found_response(),
+        Err(message) => error_response(StatusCode::INTERNAL_SERVER_ERROR, message),
+    }
+}
+
+/// Write raw bytes to an existing PTY session. `Ok(false)` means no such
+/// session, so callers can map it to their own not-found handling.
+pub(crate) fn write_pty_input(pid: u32, input: &[u8]) -> Result<bool, String> {
+    let Some(session) = find_session(pid) else {
+        return Ok(false);
     };
     let mut writer = match session.writer.lock() {
         Ok(writer) => writer,
-        Err(_) => {
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "PTY writer lock poisoned".to_owned(),
-            )
-        }
+        Err(_) => return Err("PTY writer lock poisoned".to_owned()),
     };
-    if let Err(error) = writer.write_all(&input).and_then(|_| writer.flush()) {
-        return error_response(StatusCode::INTERNAL_SERVER_ERROR, error.to_string());
-    }
-    empty_response()
+    writer
+        .write_all(input)
+        .and_then(|_| writer.flush())
+        .map_err(|error| error.to_string())?;
+    Ok(true)
 }
 
 pub async fn update(body: bytes::Bytes) -> Response {
@@ -274,6 +313,7 @@ fn create_session(
     command: CommandBuilder,
     size: PtySize,
     timeout: Option<Duration>,
+    record: ProcessRecord,
 ) -> io::Result<Arc<PtySession>> {
     let pair = native_pty_system()
         .openpty(size)
@@ -308,6 +348,7 @@ fn create_session(
         .lock()
         .expect("PTY session lock poisoned")
         .insert(pid, Arc::clone(&session));
+    processes::register(pid, record);
     spawn_pty_worker(session.clone(), reader, child);
     schedule_timeout(session.clone(), timeout);
     Ok(session)
@@ -325,8 +366,10 @@ fn schedule_timeout(session: Arc<PtySession>, timeout: Option<Duration>) {
         session.timed_out.store(true, Ordering::Release);
         #[cfg(unix)]
         {
+            // The PTY child is a session/process-group leader, so -pid reaps
+            // the whole tree, not just the shell.
             let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(session.pid as i32),
+                nix::unistd::Pid::from_raw(-(session.pid as i32)),
                 nix::sys::signal::Signal::SIGKILL,
             );
         }
@@ -369,6 +412,7 @@ fn spawn_pty_worker(
             .lock()
             .expect("PTY session lock poisoned")
             .remove(&pid);
+        processes::unregister(pid);
     });
 }
 
@@ -423,10 +467,10 @@ fn pty_end_event(
             }
         }
         WaitStatus::Signaled(_, signal, core_dumped) => {
-            // cube-envd deliberately keeps the shell convention 128+signal for
-            // the exit code (upstream Go reports -1); the status/error strings
-            // and `exited: false` match upstream's os.ProcessState rendering.
-            let exit_code = 128 + signal as i32;
+            // Match the upstream Go envd contract: a signal-killed process
+            // reports exitCode -1 (never 128+signal) with `exited: false` and
+            // a "signal: <name>" status string.
+            let exit_code = -1;
             let text = format!("signal: {}", termination::legacy_signal_name(signal as i32));
             PtyEvent::End {
                 exit_code: (!timed_out).then_some(exit_code),
@@ -591,19 +635,21 @@ async fn send_pty_event(
     true
 }
 
-fn build_command(process: PtyProcessConfig) -> io::Result<CommandBuilder> {
+fn build_command(process: PtyProcessConfig, defaults: &Defaults) -> io::Result<CommandBuilder> {
     if process.cmd.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "PTY command is empty",
         ));
     }
+    let envs = defaults.merged_env_vars(&process.envs);
+    let cwd = process.cwd.or_else(|| defaults.workdir());
     let mut command = CommandBuilder::new(process.cmd);
     command.args(process.args);
-    for (key, value) in process.envs {
+    for (key, value) in envs {
         command.env(key, value);
     }
-    if let Some(cwd) = process.cwd {
+    if let Some(cwd) = cwd {
         command.cwd(cwd);
     }
     Ok(command)
@@ -757,7 +803,7 @@ mod tests {
             }
         }
         let end = end.unwrap()["event"]["end"].clone();
-        assert_eq!(end["exitCode"], 137);
+        assert_eq!(end["exitCode"], -1);
         assert_eq!(end["exited"], false);
         assert_eq!(end["status"], "signal: killed");
         assert_eq!(end["error"], "signal: killed");
@@ -802,5 +848,73 @@ mod tests {
                 .status(),
             StatusCode::OK
         );
+    }
+
+    #[tokio::test]
+    async fn empty_pty_command_returns_bad_request() {
+        let body = bytes::Bytes::from(encode_stream_message(
+            br#"{"process":{"cmd":""},"pty":{"size":{"rows":24,"cols":80}}}"#,
+        ));
+        let response = start(HeaderMap::new(), body).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn connect_unknown_pid_returns_not_found() {
+        let request = serde_json::json!({"process":{"pid":987654321}});
+        let response = connect(bytes::Bytes::from(encode_stream_message(
+            &request.to_string().into_bytes(),
+        )))
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn send_signal_unknown_pid_returns_not_found() {
+        let request = serde_json::json!({"process":{"pid":987654321},"signal":"SIGNAL_SIGKILL"});
+        assert_eq!(
+            send_signal(bytes::Bytes::from(request.to_string()))
+                .await
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn send_signal_rejects_unsupported_signal() {
+        let request = serde_json::json!({"process":{"pid":1},"signal":"SIGNAL_SIGTERM"});
+        assert_eq!(
+            send_signal(bytes::Bytes::from(request.to_string()))
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn send_input_rejects_invalid_base64() {
+        let request = serde_json::json!({"process":{"pid":1},"input":{"pty":"@@@not-base64@@@"}});
+        assert_eq!(
+            send_input(bytes::Bytes::from(request.to_string()))
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn send_input_requires_exactly_one_arm() {
+        for input in [
+            serde_json::json!({}),
+            serde_json::json!({"stdin":"AA==","pty":"AA=="}),
+        ] {
+            let request = serde_json::json!({"process":{"pid":1},"input":input});
+            assert_eq!(
+                send_input(bytes::Bytes::from(request.to_string()))
+                    .await
+                    .status(),
+                StatusCode::NOT_IMPLEMENTED
+            );
+        }
     }
 }

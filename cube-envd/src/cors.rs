@@ -70,4 +70,15 @@ mod tests {
         let response = with_cors_headers(Response::new(Body::empty()));
         assert_eq!(response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
     }
+
+    #[test]
+    fn allow_headers_cover_connect_and_conditional_requests() {
+        let response = preflight_response();
+        let headers = response.headers()[header::ACCESS_CONTROL_ALLOW_HEADERS]
+            .to_str()
+            .unwrap();
+        for expected in ["Connect-Protocol-Version", "Range", "If-Modified-Since"] {
+            assert!(headers.contains(expected), "missing {expected}");
+        }
+    }
 }

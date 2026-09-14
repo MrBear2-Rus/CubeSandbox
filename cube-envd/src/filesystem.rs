@@ -39,6 +39,8 @@ pub(crate) struct FileEntry {
     group: String,
     #[serde(rename = "modifiedTime")]
     modified_time: String,
+    #[serde(rename = "symlinkTarget", skip_serializing_if = "Option::is_none")]
+    symlink_target: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -73,11 +75,8 @@ pub async fn list_dir(headers: HeaderMap, Json(request): Json<PathRequest>) -> R
             Ok(item) => item,
             Err(error) => return fs_error_response(error),
         };
-        let child_path = match fs::canonicalize(item.path()) {
-            Ok(path) => path,
-            Err(error) => return fs_error_response(error),
-        };
-        let metadata = match item.metadata() {
+        let child_path = item.path();
+        let metadata = match fs::symlink_metadata(&child_path) {
             Ok(metadata) => metadata,
             Err(error) => return fs_error_response(error),
         };
@@ -92,21 +91,25 @@ pub async fn stat(headers: HeaderMap, Json(request): Json<PathRequest>) -> Respo
         Ok(username) => username,
         Err(error) => return fs_error_response(error),
     };
-    let path = match existing_path(&request.path) {
-        Ok(path) => path,
-        Err(error) => return fs_error_response(error),
-    };
-    if let Err(error) = validate_directory_or_readable(&path, &username) {
-        return fs_error_response(error);
-    }
-    let metadata = match fs::metadata(&path) {
+    let path = Path::new(&request.path);
+    let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) => return fs_error_response(error),
     };
+    if metadata.is_dir() && username != "root" {
+        let allowed =
+            can_access_directory(&metadata, &username, 0o500, 0o050, 0o005).unwrap_or(false);
+        if !allowed {
+            return fs_error_response(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "directory access denied",
+            ));
+        }
+    }
     json_response(
         StatusCode::OK,
         EntryResponse {
-            entry: entry_from_meta(&path, &metadata),
+            entry: entry_from_meta(path, &metadata),
         },
     )
 }
@@ -210,7 +213,10 @@ pub async fn make_dir(headers: HeaderMap, Json(request): Json<PathRequest>) -> R
 
 fn entry_from_meta(abs_path: &Path, metadata: &Metadata) -> FileEntry {
     let mode = metadata.mode() & 0o7777;
-    let file_type = if metadata.is_dir() {
+    let is_symlink = metadata.file_type().is_symlink();
+    let file_type = if is_symlink {
+        "FILE_TYPE_SYMLINK"
+    } else if metadata.is_dir() {
         "FILE_TYPE_DIRECTORY"
     } else {
         "FILE_TYPE_FILE"
@@ -245,12 +251,25 @@ fn entry_from_meta(abs_path: &Path, metadata: &Metadata) -> FileEntry {
             .map(|group| group.name)
             .unwrap_or_else(|| metadata.gid().to_string()),
         modified_time,
+        symlink_target: if is_symlink {
+            fs::read_link(abs_path)
+                .ok()
+                .map(|target| target.to_string_lossy().into_owned())
+        } else {
+            None
+        },
     }
 }
 
 fn permission_string(metadata: &Metadata, mode: u32) -> String {
     let mut permissions = String::with_capacity(10);
-    permissions.push(if metadata.is_dir() { 'd' } else { '-' });
+    permissions.push(if metadata.file_type().is_symlink() {
+        'l'
+    } else if metadata.is_dir() {
+        'd'
+    } else {
+        '-'
+    });
     for (read, write, execute, special_bit, special) in [
         (0o400, 0o200, 0o100, 0o4000, 's'),
         (0o040, 0o020, 0o010, 0o2000, 's'),
@@ -372,25 +391,13 @@ pub(crate) fn validate_directory(path: &Path, username: &str) -> io::Result<()> 
     validate_username(username)
 }
 
-fn validate_directory_or_readable(path: &Path, username: &str) -> io::Result<()> {
-    validate_username(username)?;
-    let metadata = fs::metadata(path)?;
-    if metadata.is_dir() && !can_access_directory(&metadata, username)? {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "directory access denied",
-        ));
-    }
-    Ok(())
-}
-
 fn ensure_can_modify(path: &Path, username: &str) -> io::Result<()> {
     validate_username(username)?;
     if username == "root" {
         return Ok(());
     }
     let metadata = fs::metadata(path)?;
-    if !can_access_directory(&metadata, username)? {
+    if !can_access_directory(&metadata, username, 0o300, 0o030, 0o003)? {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "directory modification denied",
@@ -399,7 +406,13 @@ fn ensure_can_modify(path: &Path, username: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn can_access_directory(metadata: &Metadata, username: &str) -> io::Result<bool> {
+fn can_access_directory(
+    metadata: &Metadata,
+    username: &str,
+    owner_bits: u32,
+    group_bits: u32,
+    other_bits: u32,
+) -> io::Result<bool> {
     let user = nix::unistd::User::from_name(username)
         .map_err(|error| io::Error::other(error.to_string()))?
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "user not found"))?;
@@ -407,11 +420,11 @@ fn can_access_directory(metadata: &Metadata, username: &str) -> io::Result<bool>
     let owner = metadata.uid() == user.uid.as_raw();
     let group = metadata.gid() == user.gid.as_raw();
     let bits = if owner {
-        0o700
+        owner_bits
     } else if group {
-        0o070
+        group_bits
     } else {
-        0o007
+        other_bits
     };
     Ok(mode & bits == bits)
 }
@@ -543,5 +556,178 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn root_stat_bypasses_directory_permission_bits() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempdir().unwrap();
+        let restricted = directory.path().join("restricted");
+        fs::create_dir(&restricted).unwrap();
+        fs::set_permissions(&restricted, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let response = stat(
+            root_headers(),
+            Json(PathRequest {
+                path: restricted.to_string_lossy().into_owned(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn make_dir_creates_nested_parents() {
+        let directory = tempdir().unwrap();
+        let nested = directory.path().join("a").join("b").join("c");
+        let response = make_dir(
+            root_headers(),
+            Json(PathRequest {
+                path: nested.to_string_lossy().into_owned(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(nested.is_dir());
+    }
+
+    #[tokio::test]
+    async fn remove_missing_path_is_idempotent() {
+        let response = remove(
+            root_headers(),
+            Json(PathRequest {
+                path: "/tmp/cube-envd-missing-remove".to_owned(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn move_missing_source_returns_not_found() {
+        let directory = tempdir().unwrap();
+        let response = move_entry(
+            root_headers(),
+            Json(MoveRequest {
+                source: directory.path().join("nope").to_string_lossy().into_owned(),
+                destination: directory.path().join("dest").to_string_lossy().into_owned(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn stat_reports_file_metadata() {
+        let directory = tempdir().unwrap();
+        let file = directory.path().join("file.txt");
+        fs::write(&file, b"hello").unwrap();
+        let response = stat(
+            root_headers(),
+            Json(PathRequest {
+                path: file.to_string_lossy().into_owned(),
+            }),
+        )
+        .await;
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["entry"]["type"], "FILE_TYPE_FILE");
+        assert_eq!(json["entry"]["size"], "5");
+    }
+
+    #[test]
+    fn permission_string_covers_special_bits() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempdir().unwrap();
+        let file = directory.path().join("perm.sh");
+        fs::write(&file, b"x").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o4755)).unwrap();
+        let metadata = fs::metadata(&file).unwrap();
+        assert_eq!(permission_string(&metadata, 0o4755), "-rwsr-xr-x");
+    }
+
+    #[tokio::test]
+    async fn list_dir_on_file_returns_bad_request() {
+        let directory = tempdir().unwrap();
+        let file = directory.path().join("f.txt");
+        fs::write(&file, b"x").unwrap();
+        let response = list_dir(
+            root_headers(),
+            Json(PathRequest {
+                path: file.to_string_lossy().into_owned(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn list_dir_and_stat_report_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempdir().unwrap();
+        let target = directory.path().join("target.txt");
+        fs::write(&target, b"hi").unwrap();
+        let link = directory.path().join("link.txt");
+        symlink("target.txt", &link).unwrap();
+
+        let response = list_dir(
+            root_headers(),
+            Json(PathRequest {
+                path: directory.path().to_string_lossy().into_owned(),
+            }),
+        )
+        .await;
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let link_entry = json["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["name"] == "link.txt")
+            .expect("link is listed");
+        assert_eq!(link_entry["type"], "FILE_TYPE_SYMLINK");
+        assert_eq!(link_entry["symlinkTarget"], "target.txt");
+        assert!(link_entry["permissions"].as_str().unwrap().starts_with('l'));
+
+        let response = stat(
+            root_headers(),
+            Json(PathRequest {
+                path: link.to_string_lossy().into_owned(),
+            }),
+        )
+        .await;
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["entry"]["type"], "FILE_TYPE_SYMLINK");
+        assert_eq!(json["entry"]["symlinkTarget"], "target.txt");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn list_dir_tolerates_dangling_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempdir().unwrap();
+        symlink("missing.txt", directory.path().join("dangling.txt")).unwrap();
+
+        let response = list_dir(
+            root_headers(),
+            Json(PathRequest {
+                path: directory.path().to_string_lossy().into_owned(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["name"] == "dangling.txt"));
     }
 }
